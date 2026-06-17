@@ -1,0 +1,201 @@
+# =============================================================================
+# docker-compose.yml — Fintel Platform
+# =============================================================================
+# Single compose file for the entire project. Add new phases here only.
+#
+# Phase 1 services (active): postgres, pipeline, notebook
+# Phase 2 services (active): chromadb
+# Phase 3+ services (commented): redis, mlflow, api, frontend
+#
+# Usage:
+#   docker compose up -d                    start all services
+#   docker compose run pipeline python run_phase2.py
+#   docker compose logs -f pipeline         tail logs
+#   docker compose down                     stop all
+#   docker compose down -v                  stop + wipe volumes
+
+networks:
+  fintel_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  raw_data:
+  processed_data:
+  labels_data:
+  outputs_data:
+  logs_data:
+  notebook_work:
+  huggingface_cache:
+  chroma_data:        # ChromaDB vector store
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: fintel_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB:       ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    networks:
+      - fintel_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── ChromaDB (vector store for RAG) ─────────────────────────────────────────
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: fintel_chromadb
+    restart: unless-stopped
+    volumes:
+      - chroma_data:/chroma/chroma
+    ports:
+      - "8000:8000"
+    networks:
+      - fintel_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Pipeline ─────────────────────────────────────────────────────────────────
+  pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: fintel_pipeline
+    restart: "no"
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      CHROMA_HOST:   chromadb
+      TRANSFORMERS_CACHE: /cache/huggingface
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - raw_data:/app/data/raw
+      - processed_data:/app/data/processed
+      - labels_data:/app/data/labels
+      - outputs_data:/app/outputs
+      - logs_data:/app/logs
+      - huggingface_cache:/cache/huggingface
+      - ./src:/app/src
+      - ./config.py:/app/config.py
+      - ./run_phase1.py:/app/run_phase1.py
+      - ./run_phase2.py:/app/run_phase2.py
+    networks:
+      - fintel_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+
+  # ── Jupyter Notebook ──────────────────────────────────────────────────────
+  notebook:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: fintel_notebook
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      CHROMA_HOST:   chromadb
+      TRANSFORMERS_CACHE: /cache/huggingface
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - raw_data:/app/data/raw
+      - processed_data:/app/data/processed
+      - labels_data:/app/data/labels
+      - outputs_data:/app/outputs
+      - logs_data:/app/logs
+      - notebook_work:/app/notebooks
+      - huggingface_cache:/cache/huggingface
+      - ./src:/app/src
+      - ./config.py:/app/config.py
+    command: >
+      jupyter notebook
+      --ip=0.0.0.0
+      --port=8888
+      --no-browser
+      --NotebookApp.token=${JUPYTER_TOKEN}
+      --notebook-dir=/app/notebooks
+    ports:
+      - "8888:8888"
+    networks:
+      - fintel_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── Agent scheduler (Phase 2) ─────────────────────────────────────────────
+  # Runs the scanner + pre-prediction agent on a schedule
+  # Uncomment when Phase 2 agents are ready
+  # agent:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #     target: runtime
+  #   container_name: fintel_agent
+  #   restart: unless-stopped
+  #   env_file: .env
+  #   environment:
+  #     POSTGRES_HOST: postgres
+  #     CHROMA_HOST:   chromadb
+  #   volumes:
+  #     - raw_data:/app/data/raw
+  #     - processed_data:/app/data/processed
+  #     - labels_data:/app/data/labels
+  #     - logs_data:/app/logs
+  #     - ./src:/app/src
+  #     - ./config.py:/app/config.py
+  #   command: python -m src.agents.orchestrator
+  #   networks:
+  #     - fintel_net
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     chromadb:
+  #       condition: service_healthy
+
+  # ── Redis (Phase 3: job queue) ────────────────────────────────────────────
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: fintel_redis
+  #   restart: unless-stopped
+  #   ports:
+  #     - "6379:6379"
+  #   networks:
+  #     - fintel_net
+
+  # ── MLflow (Phase 3: experiment tracking) ────────────────────────────────
+  # mlflow:
+  #   image: ghcr.io/mlflow/mlflow:v2.12.1
+  #   container_name: fintel_mlflow
+  #   restart: unless-stopped
+  #   command: >
+  #     mlflow server
+  #     --backend-store-uri postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+  #     --default-artifact-root /mlflow/artifacts
+  #     --host 0.0.0.0 --port 5000
+  #   ports:
+  #     - "5000:5000"
+  #   networks:
+  #     - fintel_net
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
