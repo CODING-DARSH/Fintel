@@ -1,0 +1,127 @@
+# # # =============================================================================
+# # # requirements.txt — Pinned dependencies for full reproducibility
+# # # =============================================================================
+
+# # # ── Data ingestion ────────────────────────────────────────────────────────────
+# # yfinance==0.2.40
+# # requests==2.31.0
+# # fredapi==0.5.1
+
+# # # ── Data processing ───────────────────────────────────────────────────────────
+# # pandas==2.2.1
+# # numpy==1.26.4
+# # scipy==1.13.0
+
+# # # ── NLP ───────────────────────────────────────────────────────────────────────
+# # transformers==4.40.1
+# # torch==2.3.0
+# # tokenizers==0.19.1
+# # spacy==3.7.4
+# # sentence-transformers==2.7.0
+
+# # # ── ML / modelling ────────────────────────────────────────────────────────────
+# # scikit-learn==1.4.2
+# # xgboost==2.0.3
+# # hdbscan==0.8.38.post1          # topic clustering
+
+# # # ── LLM / agents ─────────────────────────────────────────────────────────────
+# # groq==0.9.0                    # Groq API client
+# # langgraph==0.1.19              # agent orchestration
+# # langchain==0.2.5               # tool calling utilities
+# # langchain-groq==0.1.6          # Groq + LangChain integration
+# # tavily-python==0.3.3           # Tavily web search
+# # newsapi-python==0.2.7          # NewsAPI client
+
+# # # ── RAG / vector store ────────────────────────────────────────────────────────
+# # chromadb==0.5.0                # vector store (local)
+
+# # # ── Database ──────────────────────────────────────────────────────────────────
+# # psycopg2-binary==2.9.9
+# # sqlalchemy==2.0.29
+
+# # # ── Visualisation ─────────────────────────────────────────────────────────────
+# # matplotlib==3.8.4
+# # seaborn==0.13.2
+
+# # # ── Notebook ──────────────────────────────────────────────────────────────────
+# # jupyter==1.0.0
+# # ipykernel==6.29.4
+
+# # # ── Utilities ─────────────────────────────────────────────────────────────────
+# # tqdm==4.66.2
+# # ftfy==6.2.0                     # fixes broken unicode encoding in SEC filings
+# # python-dotenv==1.0.1
+# # schedule==1.2.1                # agent 
+
+
+
+# # Phase 1 — active dependencies only
+
+# # ── Core data ──────────────────────────────────────────────────────────────
+# yfinance==0.2.40
+# requests==2.31.0
+# fredapi==0.5.1
+# pandas==2.2.1
+# numpy==1.26.4
+# scipy==1.13.0
+
+# # ── ML / NLP ────────────────────────────────────────────────────────────────
+# transformers==4.40.1
+# torch==2.3.0
+# tokenizers==0.19.1
+# scikit-learn==1.4.2
+# sentence-transformers==2.7.0
+
+# # ── Clustering ──────────────────────────────────────────────────────────────
+# hdbscan==0.8.33
+
+# # ── Text processing ─────────────────────────────────────────────────────────
+# beautifulsoup4
+# lxml
+# ftfy
+# nltk==3.8.1
+
+# # ── Vector store ────────────────────────────────────────────────────────────
+# chromadb==0.4.24
+
+# # ── Graph database ──────────────────────────────────────────────────────────
+# neo4j==5.19.0
+
+# # ── LLM clients ─────────────────────────────────────────────────────────────
+# groq==0.9.0
+
+# # ── Database ────────────────────────────────────────────────────────────────
+# psycopg2-binary==2.9.9
+# sqlalchemy==2.0.29
+
+# # ── Visualization ───────────────────────────────────────────────────────────
+# matplotlib==3.8.4
+# seaborn==0.13.2
+
+# # ── Notebook ────────────────────────────────────────────────────────────────
+# jupyter==1.0.0
+# ipykernel==6.29.4
+
+# # ── Utilities ───────────────────────────────────────────────────────────────
+# tqdm==4.66.2
+# python-dotenv==1.0.1
+# umap-learn==0.5.6
+yfinance==0.2.40
+requests==2.31.0
+fredapi==0.5.1
+matplotlib==3.8.4
+seaborn==0.13.2
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.29
+jupyter==1.0.0
+ipykernel==6.29.4
+tqdm==4.66.2
+python-dotenv==1.0.1
+ftfy
+beautifulsoup4
+lxml
+nltk==3.8.1
+chromadb==0.4.24
+neo4j==5.19.0
+groq==0.9.0
+anthropic==0.28.0

@@ -1,0 +1,10 @@
+torch==2.3.0
+transformers==4.40.1
+sentence-transformers==2.7.0
+tokenizers==0.19.1
+numpy==1.26.4
+pandas==2.2.1
+scipy==1.13.0
+scikit-learn==1.4.2
+hdbscan==0.8.33
+umap-learn==0.5.6
