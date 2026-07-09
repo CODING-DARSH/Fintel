@@ -1,18 +1,9 @@
 # =============================================================================
 # docker-compose.yml — Fintel Platform
 # =============================================================================
-# Single compose file for the entire project. Add new phases here only.
-#
 # Phase 1 services (active): postgres, pipeline, notebook
-# Phase 2 services (active): chromadb
+# Phase 2 services (active): chromadb, neo4j
 # Phase 3+ services (commented): redis, mlflow, api, frontend
-#
-# Usage:
-#   docker compose up -d                    start all services
-#   docker compose run pipeline python run_phase2.py
-#   docker compose logs -f pipeline         tail logs
-#   docker compose down                     stop all
-#   docker compose down -v                  stop + wipe volumes
 
 networks:
   fintel_net:
@@ -20,14 +11,14 @@ networks:
 
 volumes:
   postgres_data:
-  raw_data:
-  processed_data:
   labels_data:
   outputs_data:
   logs_data:
   notebook_work:
   huggingface_cache:
-  chroma_data:        # ChromaDB vector store
+  chroma_data:
+  neo4j_data:
+  neo4j_logs:
 
 services:
 
@@ -64,11 +55,32 @@ services:
       - "8000:8000"
     networks:
       - fintel_net
+
+  # ── Neo4j (knowledge graph) ──────────────────────────────────────────────────
+  neo4j:
+    image: neo4j:5.18-community
+    container_name: fintel_neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+      NEO4J_dbms_memory_heap_initial__size: 512m
+      NEO4J_dbms_memory_heap_max__size: 1G
+      NEO4J_dbms_memory_pagecache_size: 512m
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    ports:
+      - "7474:7474"   # Neo4j Browser UI
+      - "7687:7687"   # Bolt protocol (driver connection)
+    networks:
+      - fintel_net
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
 
   # ── Pipeline ─────────────────────────────────────────────────────────────────
   pipeline:
@@ -82,11 +94,16 @@ services:
     environment:
       POSTGRES_HOST: postgres
       CHROMA_HOST:   chromadb
+      NEO4J_HOST:    neo4j
+      NEO4J_PORT:    7687
       TRANSFORMERS_CACHE: /cache/huggingface
       PYTHONUNBUFFERED: "1"
     volumes:
-      - raw_data:/app/data/raw
-      - processed_data:/app/data/processed
+      - ./data/raw:/app/data/raw
+      - ./data/processed:/app/data/processed
+      - ./data/chunks:/app/data/chunks
+      - ./data/clusters:/app/data/clusters
+      - ./data/extracted:/app/data/extracted
       - labels_data:/app/data/labels
       - outputs_data:/app/outputs
       - logs_data:/app/logs
@@ -101,6 +118,8 @@ services:
       postgres:
         condition: service_healthy
       chromadb:
+        condition: service_started
+      neo4j:
         condition: service_healthy
 
   # ── Jupyter Notebook ──────────────────────────────────────────────────────
@@ -115,11 +134,16 @@ services:
     environment:
       POSTGRES_HOST: postgres
       CHROMA_HOST:   chromadb
+      NEO4J_HOST:    neo4j
+      NEO4J_PORT:    7687
       TRANSFORMERS_CACHE: /cache/huggingface
       PYTHONUNBUFFERED: "1"
     volumes:
-      - raw_data:/app/data/raw
-      - processed_data:/app/data/processed
+      - ./data/raw:/app/data/raw
+      - ./data/processed:/app/data/processed
+      - ./data/chunks:/app/data/chunks
+      - ./data/clusters:/app/data/clusters
+      - ./data/extracted:/app/data/extracted
       - labels_data:/app/data/labels
       - outputs_data:/app/outputs
       - logs_data:/app/logs
@@ -141,36 +165,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-
-  # ── Agent scheduler (Phase 2) ─────────────────────────────────────────────
-  # Runs the scanner + pre-prediction agent on a schedule
-  # Uncomment when Phase 2 agents are ready
-  # agent:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile
-  #     target: runtime
-  #   container_name: fintel_agent
-  #   restart: unless-stopped
-  #   env_file: .env
-  #   environment:
-  #     POSTGRES_HOST: postgres
-  #     CHROMA_HOST:   chromadb
-  #   volumes:
-  #     - raw_data:/app/data/raw
-  #     - processed_data:/app/data/processed
-  #     - labels_data:/app/data/labels
-  #     - logs_data:/app/logs
-  #     - ./src:/app/src
-  #     - ./config.py:/app/config.py
-  #   command: python -m src.agents.orchestrator
-  #   networks:
-  #     - fintel_net
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
-  #     chromadb:
-  #       condition: service_healthy
+      neo4j:
+        condition: service_healthy
 
   # ── Redis (Phase 3: job queue) ────────────────────────────────────────────
   # redis:
