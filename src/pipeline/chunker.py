@@ -321,7 +321,18 @@ def semantic_chunk_section(
 # File / ticker processing
 # ---------------------------------------------------------------------------
 
-def process_filing(path: Path, out_dir: Path) -> dict:
+def process_filing(path: Path, out_dir: Path, force=False) -> dict:
+    output_file = out_dir / path.name
+
+    # Resume support
+    if output_file.exists() and not force:
+        data = json.load(open(output_file))
+        return {
+            "filing_id": data["filing_id"],
+            "chunks": data["total_chunks"],
+            "status": "skipped",
+        }
+
     data        = json.load(open(path))
     ticker      = data["ticker"]
     filing_id   = data["filing_id"]
@@ -335,28 +346,42 @@ def process_filing(path: Path, out_dir: Path) -> dict:
     all_chunks = []
     for sid, text in sections.items():
         chunks = semantic_chunk_section(
-            text, ticker, filing_id, filing_type, filing_date, sid
+            text,
+            ticker,
+            filing_id,
+            filing_type,
+            filing_date,
+            sid,
         )
         all_chunks.extend(chunks)
 
     if not all_chunks:
         return {"filing_id": filing_id, "chunks": 0, "status": "no_chunks"}
 
-    (out_dir / path.name).write_text(json.dumps({
-        "filing_id"    : filing_id,
-        "ticker"       : ticker,
-        "filing_type"  : filing_type,
-        "filing_date"  : filing_date,
-        "total_chunks" : len(all_chunks),
-        "chunks"       : all_chunks,
-    }, indent=2, ensure_ascii=False))
+    output_file.write_text(
+        json.dumps(
+            {
+                "filing_id": filing_id,
+                "ticker": ticker,
+                "filing_type": filing_type,
+                "filing_date": filing_date,
+                "total_chunks": len(all_chunks),
+                "chunks": all_chunks,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
 
-    return {"filing_id": filing_id, "chunks": len(all_chunks), "status": "ok"}
+    return {
+        "filing_id": filing_id,
+        "chunks": len(all_chunks),
+        "status": "ok",
+    }
 
-
-def process_ticker(ticker: str) -> dict:
-    in_dir  = PROCESSED_DIR / ticker
-    out_dir = CHUNKS_DIR    / ticker
+def process_ticker(ticker: str, force=False) -> dict:
+    in_dir = PROCESSED_DIR / ticker
+    out_dir = CHUNKS_DIR / ticker
 
     if not in_dir.exists():
         log.warning(f"{ticker}: no processed directory")
@@ -367,28 +392,47 @@ def process_ticker(ticker: str) -> dict:
         return {"ticker": ticker, "total_chunks": 0}
 
     out_dir.mkdir(parents=True, exist_ok=True)
+
     total = 0
+
     for f in files:
         try:
-            r = process_filing(f, out_dir)
+            r = process_filing(f, out_dir, force)
             total += r["chunks"]
-            log.info(f"  {f.name}: {r['chunks']} chunks")
+
+            if r["status"] == "skipped":
+                log.info(f"  {f.name}: skipped ({r['chunks']} chunks)")
+            else:
+                log.info(f"  {f.name}: {r['chunks']} chunks")
+
         except Exception as e:
             log.error(f"  {f.name}: {e}")
 
     log.info(f"{ticker}: {total} total chunks")
-    return {"ticker": ticker, "total_chunks": total}
 
+    return {
+        "ticker": ticker,
+        "total_chunks": total,
+    }
 
 def main():
-    tickers = sys.argv[1:] if len(sys.argv) > 1 else TICKERS
+    force = "--force" in sys.argv
+    tickers = [arg for arg in sys.argv[1:] if arg != "--force"]
+
+    if not tickers:
+        tickers = TICKERS
+
     CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
 
     log.info(f"Chunking {len(tickers)} tickers...")
+    if force:
+        log.info("Force rebuild enabled")
+
     total = 0
     results = []
+
     for t in tickers:
-        r = process_ticker(t)
+        r = process_ticker(t, force)
         results.append(r)
         total += r["total_chunks"]
 
@@ -396,10 +440,10 @@ def main():
     print("CHUNKING COMPLETE")
     print("=" * 60)
     print(f"  Total chunks: {total}")
+
     for r in results:
         if r["total_chunks"] > 0:
             print(f"    {r['ticker']:<8} {r['total_chunks']} chunks")
-
-
+            
 if __name__ == "__main__":
     main()
