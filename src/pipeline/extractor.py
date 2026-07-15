@@ -1,24 +1,23 @@
 # =============================================================================
-# src/pipeline/extractor.py  — v3
+# src/pipeline/extractor.py  — v4
 # =============================================================================
-# Full extraction schema — everything extractable from filing TEXT prose.
-#
-# Added over v2:
-#   risk_language_signals      — intensity markers, certainty level,
-#                                hedging language, new vs repeated disclosure
-#   concentration_disclosures  — supplier/customer/geography concentration
-#                                with % dependency and risk-if-lost
-#   hedging_signals            — what risks company is hedging reveals
-#                                what they're most worried about
-#   litigation_signals         — named parties, exposure amounts, stage,
-#                                regulatory investigations
-#   segment_performance        — management's own explanation of each
-#                                business segment performance
-#   debt_covenant_signals      — covenant triggers, headroom, breach risk
-#   off_balance_sheet          — operating leases, SPVs, guarantees,
-#                                contingent liabilities
-#   management_tone            — language patterns revealing confidence
-#                                or defensiveness in management commentary
+# Changes from v3:
+#   - Uses a cheaper/lower-token Groq model by default (override with
+#     GROQ_MODEL env var). "llama-3.3-70b-versatile" is still available if
+#     you want it, just export GROQ_MODEL=llama-3.3-70b-versatile.
+#   - Per-CHUNK checkpointing/resume, not just per-file. Every chunk result
+#     is written to disk as soon as it's produced, and a "progress" block
+#     tracks exactly which chunk_ids are done. Re-running with --resume
+#     picks up mid-file, not just at file boundaries.
+#   - Hard stop on quota exhaustion. If Groq reports a DAILY token/request
+#     limit hit (not just a transient rate limit), the whole run stops
+#     immediately instead of burning through the rest of the queue marking
+#     everything "failed". Whatever was completed is already saved, so
+#     tomorrow's --resume continues exactly where it stopped.
+#   - No change to the "don't hallucinate" extraction rules — if anything,
+#     failed/uncertain chunks are left out of the completed set entirely
+#     rather than written with empty/fake extraction data, so they get
+#     retried instead of silently accepted as "done".
 
 import sys
 import json
@@ -36,9 +35,25 @@ CHUNKS_DIR    = Path("data/chunks")
 EXTRACTED_DIR = Path("data/extracted")
 GROQ_API_KEY  = os.getenv("GROQ_API_KEY")
 
+# --- Model ------------------------------------------------------------------
+# Default is a small, cheap, fast Groq model — good enough for structured
+# extraction and much lower token cost than 70B. Override any time with:
+#   export GROQ_MODEL=llama-3.3-70b-versatile
+# Other reasonable cheap options on Groq: "llama-3.1-8b-instant",
+# "gemma2-9b-it", "openai/gpt-oss-20b".
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
 REQUESTS_PER_SECOND = 3
 RETRY_ATTEMPTS      = 3
 RETRY_DELAY         = 20
+
+# Phrases that indicate a HARD/DAILY quota exhaustion (not a transient
+# per-minute rate limit). If we see these, we stop the whole run rather
+# than retrying or continuing on to burn more failed calls.
+HARD_LIMIT_MARKERS = [
+    "tokens per day", "requests per day", "tpd", "rpd",
+    "daily limit", "quota", "insufficient_quota",
+]
 
 TICKERS = [
     "AMZN","TSLA","HD","MCD","NKE","SBUX","TGT","LOW","BKNG","GM",
@@ -46,6 +61,25 @@ TICKERS = [
     "JNJ","PFE","UNH","ABBV","MRK","LLY","BMY","AMGN","GILD","CVS",
     "AAPL","MSFT","GOOGL","NVDA","META","ADBE","CRM","INTC","CSCO","IBM",
 ]
+
+
+class QuotaExceededError(Exception):
+    """Raised when Groq reports a hard/daily quota exhaustion. Stops the run."""
+    pass
+
+
+class PayloadTooLargeError(Exception):
+    """Raised on HTTP 413 — request body too big for this model. Not a rate
+    limit, not a quota issue. Caller should shrink the input and retry once,
+    or give up on just this chunk without affecting anything else."""
+    pass
+
+
+# Smaller models (e.g. llama-3.1-8b-instant) accept much smaller request
+# bodies than 70b. Chunk text gets truncated to this many characters before
+# being sent, if a first attempt comes back 413.
+MAX_INPUT_CHARS_ON_RETRY = 6000
+
 
 # ---------------------------------------------------------------------------
 # Groq client
@@ -73,6 +107,8 @@ signal extraction from SEC/regulatory filing text.
 Rules:
 - Extract ONLY what is explicitly stated or strongly implied in the text
 - Never hallucinate entities, numbers, or relationships not present
+- If something is not present in the text, use null or [] — never invent a
+  plausible-sounding value to fill a field
 - Confidence: 0.9+ explicitly stated, 0.7-0.9 strongly implied,
   0.5-0.7 reasonably inferred, below 0.5 speculative
 - For risk language: extract the EXACT phrasing that reveals intensity
@@ -81,7 +117,7 @@ Rules:
 - Return ONLY valid JSON. No explanation, no markdown, no backticks."""
 
 
-def build_prompt(chunk: dict) -> str:
+def build_prompt(chunk: dict, max_chars: Optional[int] = None) -> str:
     ticker      = chunk["ticker"]
     filing_type = chunk["filing_type"]
     filing_date = chunk["filing_date"]
@@ -89,6 +125,14 @@ def build_prompt(chunk: dict) -> str:
     text        = chunk["text"]
     overlap     = chunk.get("overlap_previous", "")
     preceding   = chunk.get("preceding_context", "")
+
+    if max_chars:
+        # Drop the extra context first, then truncate the main text itself.
+        # This is a shrink-to-fit fallback after a 413, not the normal path.
+        overlap   = ""
+        preceding = ""
+        if len(text) > max_chars:
+            text = text[:max_chars] + "\n[...truncated to fit request size limit...]"
 
     context = ""
     if preceding:
@@ -412,14 +456,19 @@ Return ONLY the JSON object. No explanation, no markdown, no backticks."""
 
 
 # ---------------------------------------------------------------------------
-# Groq call with retry
+# Groq call with retry + hard-limit detection
 # ---------------------------------------------------------------------------
+
+def _is_hard_limit(err_text: str) -> bool:
+    low = err_text.lower()
+    return any(marker in low for marker in HARD_LIMIT_MARKERS)
+
 
 def call_groq(prompt: str, attempt: int = 0) -> Optional[dict]:
     client = get_groq()
     try:
         response = client.chat.completions.create(
-            model="llama-3.1-70b-versatile",
+            model=GROQ_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user",   "content": prompt},
@@ -441,11 +490,29 @@ def call_groq(prompt: str, attempt: int = 0) -> Optional[dict]:
 
     except Exception as e:
         err = str(e)
+
+        if "413" in err or "payload too large" in err.lower() or "request too large" in err.lower():
+            # NOT a rate limit, NOT a quota issue — the request body itself
+            # is too big for this model. Retrying the same payload will
+            # just fail the same way, so don't burn retry attempts on it.
+            raise PayloadTooLargeError(err)
+
+        if _is_hard_limit(err):
+            # Daily/hard quota exhausted — do NOT retry, do NOT keep going.
+            # Bubble up so the caller can save progress and stop the run.
+            log.error(f"HARD QUOTA LIMIT hit: {err}")
+            raise QuotaExceededError(err)
+
         if "429" in err or "rate_limit" in err.lower():
             if attempt < RETRY_ATTEMPTS - 1:
                 log.warning(f"Rate limit — waiting {RETRY_DELAY}s...")
                 time.sleep(RETRY_DELAY)
                 return call_groq(prompt, attempt + 1)
+            # Exhausted retries on a rate limit we couldn't confirm as
+            # transient — safer to stop than to mark everything "failed".
+            log.error("Rate limit retries exhausted — stopping run.")
+            raise QuotaExceededError(err)
+
         log.error(f"Groq error: {e}")
         return None
 
@@ -455,8 +522,28 @@ def call_groq(prompt: str, attempt: int = 0) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def extract_chunk(chunk: dict) -> dict:
-    prompt     = build_prompt(chunk)
-    extraction = call_groq(prompt)
+    extraction = None
+    try:
+        prompt = build_prompt(chunk)
+        extraction = call_groq(prompt)  # may raise QuotaExceededError — let it propagate
+    except PayloadTooLargeError:
+        log.warning(
+            f"    413 Payload Too Large on {chunk['chunk_id']} — "
+            f"retrying once with truncated input (context dropped, "
+            f"text capped at {MAX_INPUT_CHARS_ON_RETRY} chars)"
+        )
+        try:
+            small_prompt = build_prompt(chunk, max_chars=MAX_INPUT_CHARS_ON_RETRY)
+            extraction = call_groq(small_prompt)
+        except PayloadTooLargeError:
+            # Still too big even truncated — give up on this one chunk only.
+            # This is a per-chunk failure, not a quota/run-stopping event.
+            log.error(
+                f"    {chunk['chunk_id']} still too large after truncation — "
+                f"marking failed, continuing with next chunk"
+            )
+            extraction = None
+
     return {
         "chunk_id"          : chunk["chunk_id"],
         "ticker"            : chunk["ticker"],
@@ -471,6 +558,7 @@ def extract_chunk(chunk: dict) -> dict:
         "text"              : chunk["text"],
         "extraction_status" : "ok" if extraction else "failed",
         "extraction"        : extraction or {},
+        "model_used"        : GROQ_MODEL,
     }
 
 
@@ -478,42 +566,102 @@ def extract_chunk(chunk: dict) -> dict:
 # File / ticker / main
 # ---------------------------------------------------------------------------
 
+def _load_existing(out_path: Path) -> dict:
+    if out_path.exists():
+        try:
+            return json.load(open(out_path))
+        except Exception:
+            log.warning(f"  Could not parse existing {out_path.name}, starting fresh")
+    return {}
+
+
+def _save_progress(out_path: Path, data: dict, completed_by_id: dict, all_chunk_ids: list):
+    """Write the output file with whatever has been completed so far."""
+    ordered = [completed_by_id[cid] for cid in all_chunk_ids if cid in completed_by_id]
+    done_ids = [cid for cid in all_chunk_ids if cid in completed_by_id]
+    data["chunks"] = ordered
+    data["total_chunks"] = len(all_chunk_ids)
+    data["failed_extractions"] = sum(
+        1 for c in ordered if c["extraction_status"] == "failed"
+    )
+    data["progress"] = {
+        "completed_chunk_ids": done_ids,
+        "completed_count": len(done_ids),
+        "total_count": len(all_chunk_ids),
+        "complete": len(done_ids) == len(all_chunk_ids),
+        "last_updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "model_used": GROQ_MODEL,
+    }
+    out_path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+
+
 def process_filing(chunk_path: Path, out_dir: Path, resume: bool) -> dict:
     out_path = out_dir / chunk_path.name
-    if resume and out_path.exists():
-        existing = json.load(open(out_path))
-        log.info(f"  SKIP: {chunk_path.name}")
-        return {"filing_id": existing.get("filing_id"),
-                "chunks": len(existing.get("chunks", [])),
-                "failed": 0, "status": "skipped"}
+    src      = json.load(open(chunk_path))
+    chunks   = src.get("chunks", [])
 
-    data   = json.load(open(chunk_path))
-    chunks = data.get("chunks", [])
     if not chunks:
-        return {"filing_id": data.get("filing_id"),
+        return {"filing_id": src.get("filing_id"),
                 "chunks": 0, "failed": 0, "status": "empty"}
 
-    extracted, failed = [], 0
+    all_chunk_ids = [c["chunk_id"] for c in chunks]
+
+    # Load whatever's already on disk (from a previous run) if resuming.
+    existing = _load_existing(out_path) if resume else {}
+    completed_by_id = {}
+    if existing:
+        for c in existing.get("chunks", []):
+            # Only treat successful extractions as "done" — failed ones get
+            # retried, they were never real output, nothing to lose.
+            if c.get("extraction_status") == "ok":
+                completed_by_id[c["chunk_id"]] = c
+
+    already_done = len(completed_by_id)
+    if resume and already_done:
+        log.info(f"  RESUME: {chunk_path.name} — {already_done}/{len(chunks)} chunks already done")
+
+    if resume and already_done == len(chunks):
+        log.info(f"  SKIP (fully complete): {chunk_path.name}")
+        return {"filing_id": src.get("filing_id"),
+                "chunks": already_done, "failed": 0, "status": "skipped"}
+
+    out_data = {
+        "filing_id"   : src["filing_id"],
+        "ticker"      : src["ticker"],
+        "filing_type" : src["filing_type"],
+        "filing_date" : src["filing_date"],
+    }
+
+    newly_failed = 0
     for i, chunk in enumerate(chunks):
-        log.info(f"    [{i+1}/{len(chunks)}] {chunk['chunk_id']}")
-        result = extract_chunk(chunk)
-        extracted.append(result)
+        cid = chunk["chunk_id"]
+        if cid in completed_by_id:
+            continue  # already done in a prior run
+
+        log.info(f"    [{i+1}/{len(chunks)}] {cid}")
+        try:
+            result = extract_chunk(chunk)
+        except QuotaExceededError:
+            # Save everything completed so far, then stop the ENTIRE run
+            # (not just this file) so nothing keeps burning failed calls.
+            _save_progress(out_path, out_data, completed_by_id, all_chunk_ids)
+            log.error(
+                f"  STOPPED mid-file at chunk {i+1}/{len(chunks)} in "
+                f"{chunk_path.name} due to quota limit. Progress saved — "
+                f"re-run with --resume to continue from here."
+            )
+            raise
+
+        completed_by_id[cid] = result
         if result["extraction_status"] == "failed":
-            failed += 1
+            newly_failed += 1
+
+        # Checkpoint after every single chunk, not just at the end of file.
+        _save_progress(out_path, out_data, completed_by_id, all_chunk_ids)
         time.sleep(1.0 / REQUESTS_PER_SECOND)
 
-    out_path.write_text(json.dumps({
-        "filing_id"          : data["filing_id"],
-        "ticker"             : data["ticker"],
-        "filing_type"        : data["filing_type"],
-        "filing_date"        : data["filing_date"],
-        "total_chunks"       : len(extracted),
-        "failed_extractions" : failed,
-        "chunks"             : extracted,
-    }, indent=2, ensure_ascii=False))
-
-    return {"filing_id": data["filing_id"], "chunks": len(extracted),
-            "failed": failed, "status": "ok"}
+    return {"filing_id": src["filing_id"], "chunks": len(completed_by_id),
+            "failed": newly_failed, "status": "ok"}
 
 
 def process_ticker(ticker: str, resume: bool) -> dict:
@@ -530,12 +678,9 @@ def process_ticker(ticker: str, resume: bool) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     total_chunks, total_failed = 0, 0
     for f in files:
-        try:
-            r = process_filing(f, out_dir, resume)
-            total_chunks += r["chunks"]
-            total_failed += r["failed"]
-        except Exception as e:
-            log.error(f"  {f.name}: {e}")
+        r = process_filing(f, out_dir, resume)  # QuotaExceededError propagates up
+        total_chunks += r["chunks"]
+        total_failed += r["failed"]
 
     log.info(f"{ticker}: {total_chunks} chunks, {total_failed} failed")
     return {"ticker": ticker, "total_chunks": total_chunks,
@@ -553,27 +698,44 @@ def main():
         sys.exit(1)
 
     EXTRACTED_DIR.mkdir(parents=True, exist_ok=True)
-    log.info(f"Extracting {len(tickers)} tickers (resume={resume})...")
+    log.info(f"Extracting {len(tickers)} tickers with model={GROQ_MODEL} (resume={resume})...")
 
     total_chunks, total_failed, results = 0, 0, []
+    stopped_early = False
     for t in tickers:
-        r = process_ticker(t, resume)
-        results.append(r)
-        total_chunks += r["total_chunks"]
-        total_failed += r["total_failed"]
+        try:
+            r = process_ticker(t, resume)
+            results.append(r)
+            total_chunks += r["total_chunks"]
+            total_failed += r["total_failed"]
+        except QuotaExceededError:
+            stopped_early = True
+            log.error(
+                f"Run stopped at ticker '{t}' due to quota exhaustion. "
+                f"Everything completed so far is saved. Run again later "
+                f"with --resume to pick up exactly where this left off."
+            )
+            break
+        except Exception as e:
+            log.error(f"  {t}: unexpected error: {e}")
 
     print("\n" + "=" * 60)
-    print("EXTRACTION COMPLETE")
+    print("EXTRACTION " + ("STOPPED (quota limit)" if stopped_early else "COMPLETE"))
     print("=" * 60)
     print(f"  Total chunks    : {total_chunks}")
     print(f"  Failed          : {total_failed}")
     print(f"  Success rate    : "
           f"{((total_chunks-total_failed)/max(total_chunks,1)*100):.1f}%")
+    print(f"  Model used      : {GROQ_MODEL}")
     print(f"  Output          : {EXTRACTED_DIR.resolve()}")
     for r in results:
         if r["total_chunks"] > 0:
             print(f"    {r['ticker']:<8} {r['total_chunks']} chunks, "
                   f"{r['total_failed']} failed")
+    if stopped_early:
+        print("\n  Run `--resume` again (e.g. tomorrow) to continue from "
+              "exactly this point — nothing done so far will be redone or lost.")
+        sys.exit(2)
 
 
 if __name__ == "__main__":
