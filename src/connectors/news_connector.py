@@ -3,7 +3,7 @@
 # =============================================================================
 # Fetches financial news from NewsAPI and RSS feeds
 # Stores raw articles in data/news/raw/YYYY-MM-DD/*.json
-# Extracts entities + signals via Groq
+# Extracts entities + signals via shared Gemini+Groq rotation (see extract_article)
 # Stores enriched articles in data/news/extracted/YYYY-MM-DD/*.json
 # Links news events to existing Neo4j graph nodes
 #
@@ -30,6 +30,17 @@ import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+
+# Running this file directly (python src/connectors/news_connector.py)
+# only adds THIS file's own directory (src/connectors) to sys.path, not
+# the project root — needed here because extract_article() imports
+# `from src.pipeline.extractor import call_llm`, a cross-package import
+# that requires the project root to be on sys.path. Same fix as
+# backtest_propagation.py, different parent depth since this file sits
+# one level shallower under src/.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(message)s")
 log = logging.getLogger(__name__)
@@ -91,6 +102,10 @@ _driver = None
 
 
 def get_groq():
+    """Kept only for backward compatibility — no longer used by
+    extract_article(), which now uses the shared multi-provider
+    call_llm from extractor.py instead of a Groq-only client. See
+    extract_article()'s docstring for why this changed."""
     global _groq
     if _groq is None:
         from groq import Groq
@@ -117,7 +132,7 @@ def run_query(query: str, params: dict = None):
 # NewsAPI fetching
 # ---------------------------------------------------------------------------
 
-def fetch_newsapi(query: str, from_date: str, page_size: int = 10) -> list:
+def fetch_newsapi(query: str, from_date: str, page_size: int = 5) -> list:
     """Fetch articles from NewsAPI for a query string."""
     if not NEWS_API_KEY:
         log.warning("NEWS_API_KEY not set — skipping NewsAPI")
@@ -242,8 +257,21 @@ Return ONLY a JSON object:
 
 
 def extract_article(article: dict, attempt: int = 0) -> Optional[dict]:
-    """Extract structured signals from one news article via Groq."""
-    client  = get_groq()
+    """
+    Extract structured signals from one news article.
+
+    CHANGED: previously called Groq directly and exclusively — meaning
+    when Groq's daily quota ran out, news extraction had NO fallback at
+    all, even though Gemini keys (used by extractor.py) might still have
+    budget. Now uses the shared multi-provider call_llm from
+    extractor.py, same rotation across Gemini + Groq keys the filing
+    extraction pipeline already uses. This fixes the immediate "Groq
+    quota exhausted, news extraction fully blocked" problem, and also
+    consolidates what used to be two separate, duplicated LLM-calling
+    implementations into one.
+    """
+    from src.pipeline.extractor import call_llm
+
     content = (article.get("content") or article.get("description") or "")[:2000]
     prompt  = NEWS_EXTRACTION_PROMPT.format(
         title   = article.get("title", ""),
@@ -251,28 +279,7 @@ def extract_article(article: dict, attempt: int = 0) -> Optional[dict]:
         date    = article.get("publishedAt", ""),
         content = content,
     )
-    try:
-        response = client.chat.completions.create(
-            model    = "llama-3.3-70b-versatile",
-            messages = [{"role": "user", "content": prompt}],
-            max_tokens  = 800,
-            temperature = 0.1,
-        )
-        raw = response.choices[0].message.content.strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-        return json.loads(raw.strip())
-    except json.JSONDecodeError:
-        if attempt < 2:
-            time.sleep(2)
-            return extract_article(article, attempt + 1)
-        return None
-    except Exception as e:
-        if "429" in str(e) and attempt < 2:
-            time.sleep(RETRY_DELAY)
-            return extract_article(article, attempt + 1)
-        log.error(f"Groq error: {e}")
-        return None
+    return call_llm(prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +423,7 @@ def run(tickers: list, fetch_date: str):
         for ticker in tickers:
             name  = TICKER_TO_NAME.get(ticker, ticker)
             query = f"{name} OR {ticker}"
-            arts  = fetch_newsapi(query, fetch_date, page_size=5)
+            arts  = fetch_newsapi(query, fetch_date, page_size=3)
             for a in arts:
                 a["_ticker_query"] = ticker
             all_articles.extend(arts)
@@ -445,8 +452,22 @@ def run(tickers: list, fetch_date: str):
         [a for _, a in unique], indent=2, ensure_ascii=False
     ))
 
-    # Extract + load to graph
+    # Extract + load to graph — written to disk after EACH article, not
+    # once at the end. A batched single write-at-the-end (the original
+    # approach) means a crash/kill mid-run (Ctrl+C, rate-limit
+    # exhaustion, container timeout — all things that have actually
+    # happened today) loses every successfully-extracted article that
+    # hadn't been written yet, even though load_news_to_graph() already
+    # wrote them into Neo4j in real time. Per-article save closes that
+    # gap: the graph and the local JSON record stay in sync, and a
+    # future run can tell what's already been processed instead of
+    # starting blind. Matches extractor.py's save_chunk() pattern.
+    ext_path = date_ext_dir / "articles.json"
     extracted = []
+
+    def _save_extracted():
+        ext_path.write_text(json.dumps(extracted, indent=2, ensure_ascii=False))
+
     for i, (aid, article) in enumerate(unique):
         log.info(f"  [{i+1}/{len(unique)}] Extracting: {article.get('title','')[:60]}")
         ext = extract_article(article)
@@ -457,6 +478,7 @@ def run(tickers: list, fetch_date: str):
             "fetch_date" : fetch_date,
         }
         extracted.append(enriched)
+        _save_extracted()   # crash-safe: write after EVERY article, not just at the end
 
         if ext:
             try:
@@ -465,10 +487,6 @@ def run(tickers: list, fetch_date: str):
                 log.error(f"  Graph load error: {e}")
 
         time.sleep(1.0 / REQUESTS_PER_SECOND)
-
-    # Save extracted
-    ext_path = date_ext_dir / "articles.json"
-    ext_path.write_text(json.dumps(extracted, indent=2, ensure_ascii=False))
 
     log.info(f"Done. Raw: {raw_path} | Extracted: {ext_path}")
     return len(extracted)
@@ -497,9 +515,13 @@ def main():
 
     if not NEWS_API_KEY:
         log.warning("NEWS_API_KEY not set — will use RSS feeds only")
-    if not GROQ_API_KEY:
-        log.error("GROQ_API_KEY not set")
-        sys.exit(1)
+    # NOTE: extract_article() now uses the shared call_llm from
+    # extractor.py, which expects GEMINI_API_KEY_1/2/3 and/or
+    # GROQ_API_KEY_1/2/3 (not the old single GROQ_API_KEY this used to
+    # check). extractor.py itself validates key presence on import and
+    # exits with a clear message if none are found — no separate check
+    # needed here, and the old check was stale/wrong after this file
+    # stopped using GROQ_API_KEY directly.
 
     log.info(f"Fetching news for {len(tickers)} tickers on {date_str}")
     count = run(tickers, date_str)
@@ -514,4 +536,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()  

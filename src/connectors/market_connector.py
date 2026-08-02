@@ -144,15 +144,15 @@ def fetch_price_data(ticker: str) -> Optional[dict]:
         price  = float(latest["Close"])
 
         # Trend signals
-        above_ma50  = price > ma_50  if ma_50  else None
-        above_ma200 = price > ma_200 if ma_200 else None
-        golden_cross = (ma_50 > ma_200) if (ma_50 and ma_200) else None
+        above_ma50 = bool(price > ma_50) if ma_50 else None
+        above_ma200 = bool(price > ma_200) if ma_200 else None
+        golden_cross = bool(ma_50 > ma_200) if (ma_50 and ma_200) else None
 
         # Signal flags
-        is_volume_spike   = volume_ratio >= VOLUME_SPIKE_THRESHOLD
-        is_large_move     = abs(pct_1d) >= PRICE_MOVE_THRESHOLD
-        near_52w_high     = pct_from_52w_high >= -5.0
-        near_52w_low      = pct_from_52w_high <= -40.0
+        is_volume_spike = bool(volume_ratio >= VOLUME_SPIKE_THRESHOLD)
+        is_large_move = bool(abs(pct_1d) >= PRICE_MOVE_THRESHOLD)
+        near_52w_high = bool(pct_from_52w_high >= -5.0)
+        near_52w_low = bool(pct_from_52w_high <= -40.0)
 
         return {
             "ticker"            : ticker,
