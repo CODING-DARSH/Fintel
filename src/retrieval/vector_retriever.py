@@ -376,7 +376,44 @@ class VectorRetriever:
                 },
             ))
 
+        # Date filtering happens here, in Python, on the full candidate
+        # list — BEFORE the top_k truncation below — since Chroma's where
+        # clause can no longer do this (see _build_where note above).
+        # Filtering after truncation would silently shrink an already-
+        # capped result set instead of giving the caller a full top_k
+        # of dates that actually match.
+        if date_from or date_to:
+            results = self._filter_by_date(results, date_from, date_to)
+
         return results[:top_k]
+
+    @staticmethod
+    def _filter_by_date(
+        results: list,
+        date_from: Optional[str],
+        date_to: Optional[str],
+    ) -> list:
+        """
+        Plain string comparison against filing_date — correct for ISO
+        8601 formatted dates ("YYYY-MM-DD") without needing to parse them,
+        since lexicographic string ordering matches chronological ordering
+        for this format. Results with a missing/empty filing_date are
+        kept, not silently dropped — an unknown date isn't evidence the
+        date requirement fails, it's just unknown, and dropping it would
+        be a stronger claim than the data supports.
+        """
+        filtered = []
+        for r in results:
+            fd = getattr(r, "filing_date", None)
+            if not fd:
+                filtered.append(r)
+                continue
+            if date_from and fd < date_from:
+                continue
+            if date_to and fd > date_to:
+                continue
+            filtered.append(r)
+        return filtered
 
     def _build_where(
         self,
@@ -404,10 +441,20 @@ class VectorRetriever:
         elif filing_types:
             conditions.append({"filing_type": {"$in": filing_types}})
 
-        if date_from:
-            conditions.append({"filing_date": {"$gte": date_from}})
-        if date_to:
-            conditions.append({"filing_date": {"$lte": date_to}})
+        # NOTE: date_from/date_to are deliberately NOT added to the Chroma
+        # where clause here. filing_date is stored as a plain string
+        # (e.g. "2022-01-01") in this collection's metadata, and Chroma's
+        # $gte/$lte operators only support numeric comparison — passing a
+        # string caused a hard failure ("Expected operand value to be an
+        # int or a float for operator $gte, got 2022-01-01"), not a silent
+        # no-op. Date filtering is applied as a plain string comparison in
+        # Python after retrieval instead (see _filter_by_date below) —
+        # safe because ISO 8601 dates sort identically as strings or as
+        # actual dates, so no conversion is needed, just a different place
+        # to apply the comparison. If filing_date is ever migrated to a
+        # numeric format at ingestion time, this can move back into the
+        # where clause for a small efficiency gain, but is not required
+        # for correctness.
 
         if not conditions:
             return None
