@@ -46,7 +46,7 @@ services:
 
   # ── ChromaDB (vector store for RAG) ─────────────────────────────────────────
   chromadb:
-    image: chromadb/chroma:latest
+    image: chromadb/chroma:0.4.24
     container_name: fintel_chromadb
     restart: unless-stopped
     volumes:
@@ -112,6 +112,13 @@ services:
       - ./config.py:/app/config.py
       - ./run_phase1.py:/app/run_phase1.py
       - ./run_phase2.py:/app/run_phase2.py
+      - ./data/news:/app/data/news
+      - ./data/macro:/app/data/macro
+      - ./data/market:/app/data/market
+      - ./data/eval:/app/data/eval
+      - ./run_agent_query.py:/app/run_agent_query.py 
+      - ./check_todays_news.py:/app/check_todays_news.py 
+      - ./check_panasonic.py:/app/check_panasonic.py 
     networks:
       - fintel_net
     depends_on:
@@ -122,51 +129,51 @@ services:
       neo4j:
         condition: service_healthy
 
-  # ── Jupyter Notebook ──────────────────────────────────────────────────────
-  notebook:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: runtime
-    container_name: fintel_notebook
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      POSTGRES_HOST: postgres
-      CHROMA_HOST:   chromadb
-      NEO4J_HOST:    neo4j
-      NEO4J_PORT:    7687
-      TRANSFORMERS_CACHE: /cache/huggingface
-      PYTHONUNBUFFERED: "1"
-    volumes:
-      - ./data/raw:/app/data/raw
-      - ./data/processed:/app/data/processed
-      - ./data/chunks:/app/data/chunks
-      - ./data/clusters:/app/data/clusters
-      - ./data/extracted:/app/data/extracted
-      - labels_data:/app/data/labels
-      - outputs_data:/app/outputs
-      - logs_data:/app/logs
-      - notebook_work:/app/notebooks
-      - huggingface_cache:/cache/huggingface
-      - ./src:/app/src
-      - ./config.py:/app/config.py
-    command: >
-      jupyter notebook
-      --ip=0.0.0.0
-      --port=8888
-      --no-browser
-      --NotebookApp.token=${JUPYTER_TOKEN}
-      --notebook-dir=/app/notebooks
-    ports:
-      - "8888:8888"
-    networks:
-      - fintel_net
-    depends_on:
-      postgres:
-        condition: service_healthy
-      neo4j:
-        condition: service_healthy
+  # # ── Jupyter Notebook ──────────────────────────────────────────────────────
+  # notebook:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #     target: runtime
+  #   container_name: fintel_notebook
+  #   restart: unless-stopped
+  #   env_file: .env
+  #   environment:
+  #     POSTGRES_HOST: postgres
+  #     CHROMA_HOST:   chromadb
+  #     NEO4J_HOST:    neo4j
+  #     NEO4J_PORT:    7687
+  #     TRANSFORMERS_CACHE: /cache/huggingface
+  #     PYTHONUNBUFFERED: "1"
+  #   volumes:
+  #     - ./data/raw:/app/data/raw
+  #     - ./data/processed:/app/data/processed
+  #     - ./data/chunks:/app/data/chunks
+  #     - ./data/clusters:/app/data/clusters
+  #     - ./data/extracted:/app/data/extracted
+  #     - labels_data:/app/data/labels
+  #     - outputs_data:/app/outputs
+  #     - logs_data:/app/logs
+  #     - notebook_work:/app/notebooks
+  #     - huggingface_cache:/cache/huggingface
+  #     - ./src:/app/src
+  #     - ./config.py:/app/config.py
+  #   command: >
+  #     jupyter notebook
+  #     --ip=0.0.0.0
+  #     --port=8888
+  #     --no-browser
+  #     --NotebookApp.token=${JUPYTER_TOKEN}
+  #     --notebook-dir=/app/notebooks
+  #   ports:
+  #     - "8888:8888"
+  #   networks:
+  #     - fintel_net
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     neo4j:
+  #       condition: service_healthy
 
   # ── Redis (Phase 3: job queue) ────────────────────────────────────────────
   # redis:
