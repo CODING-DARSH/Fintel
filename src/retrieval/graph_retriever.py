@@ -23,6 +23,8 @@
 #   macro_impact          — macro signals affecting companies
 
 import os
+import re
+import inspect
 import logging
 from typing import Any, Optional
 from dataclasses import dataclass, field
@@ -93,6 +95,62 @@ class GraphRetriever:
     # -------------------------------------------------------------------------
     # Core retrieval methods
     # -------------------------------------------------------------------------
+
+    # -----------------------------------------------------------------------
+    # Generic dispatch — call any get_* method by name, filtered to the
+    # kwargs it actually accepts. This exists so new query types only ever
+    # need a new get_* method added below; callers (gather_evidence.py,
+    # test_retrieval.py, anything else) never need their own if/elif chain
+    # duplicated and kept in sync with this class's method list.
+    # -----------------------------------------------------------------------
+
+    KNOWN_QUERY_METHODS_PREFIX = "get_"
+
+    def query(self, query_type: str, **kwargs) -> list:
+        """
+        Generic entry point: query_type is the method name (e.g.
+        "get_company_risks", "get_macro_impact"). kwargs can pass any
+        candidate parameter name — only the ones the target method
+        actually declares are forwarded, everything else is dropped
+        silently (this is what lets one caller pass a broad, speculative
+        set of candidate kwargs without needing to know each method's
+        exact signature).
+
+        Unknown query_type, or a query_type that isn't one of this
+        class's own get_* methods, logs a warning and returns [] rather
+        than raising — keeps this safe to call with a model-provided or
+        otherwise dynamic query_type.
+
+        get_company_overview is intentionally excluded — it returns a
+        dict, not list[GraphResult], and callers expecting a list should
+        not silently receive one.
+        """
+        if not query_type.startswith(self.KNOWN_QUERY_METHODS_PREFIX):
+            log.warning(f"Rejected graph query_type (must start with 'get_'): {query_type!r}")
+            return []
+
+        method = getattr(self, query_type, None)
+        if method is None or not callable(method):
+            log.warning(f"Unknown graph query_type: {query_type!r}")
+            return []
+
+        if query_type == "get_company_overview":
+            log.warning("get_company_overview returns a dict, not a list — use it directly instead of query()")
+            return []
+
+        sig = inspect.signature(method)
+        valid_kwargs = {
+            k: v for k, v in kwargs.items()
+            if k in sig.parameters and v is not None
+        }
+
+        try:
+            result = method(**valid_kwargs)
+        except Exception as e:
+            log.error(f"graph query {query_type!r} failed: {e}")
+            return []
+
+        return result if isinstance(result, list) else []
 
     def get_company_risks(
         self,
@@ -667,3 +725,153 @@ class GraphRetriever:
         """
         rows = self._run(query, {"ticker": ticker.upper()})
         return rows[0] if rows else {}
+
+    # -----------------------------------------------------------------------
+    # Propagation path exploration — NOT the same as get_propagation_risks()
+    # above, which reads pre-extracted PROPAGATES_TO chains from a single
+    # filing's explicit propagation_risks disclosure. This method instead
+    # searches OUTWARD across general relationship types from any starting
+    # entity (an Input, Geography, or Event) to find companies connected
+    # to it via chains that may span MULTIPLE independently-extracted
+    # filings — no single document needs to have stated the full chain.
+    #
+    # Returns raw path data (nodes + relationship properties per path) —
+    # scoring/weighting happens in src/agents/analytics/graph_propagation.py,
+    # not here. This method's job is only: does a path exist, and what
+    # does it look like structurally.
+    # -----------------------------------------------------------------------
+
+    PROPAGATION_REL_TYPES = (
+        "DEPENDS_ON|SUPPLIES_TO|SOURCED_FROM|EXPOSED_TO|PROPAGATES_TO|BUYS_FROM"
+        "|CONCENTRATED_IN|HAS_CONCENTRATION"
+    )
+    # CONCENTRATED_IN/HAS_CONCENTRATION added after a real backtest event
+    # (MCD's Russia market exit) revealed the original whitelist missed
+    # them — MCD's actual connection to Russia in the graph is via these
+    # relation types, not the ones originally listed, so propagation
+    # would have silently found "no companies reached" despite the data
+    # genuinely being there. Worth re-checking this list periodically as
+    # more real test cases surface gaps like this one.
+
+    START_LABEL_ID_FIELD = {
+        "Input"      : "input_id",
+        "Geography"  : "geo_id",
+        "Event"      : "event_id",
+        "Company"    : "ticker",
+    }
+
+    def node_exists(self, label: str, id_value: str) -> bool:
+        """
+        Cheap existence check for a candidate propagation start entity.
+        This is what makes propagation triggering airtight rather than a
+        guess: instead of trusting an LLM-chosen retrieval_focus label
+        (which real runs showed is unreliable — a model asked to
+        decompose a graphite/China question labeled its sub-questions
+        "regulatory", "macro", "supply_chain" etc., never "propagation",
+        even though the question was clearly propagation-shaped), we
+        check whether a plausible start entity (a geography or keyword
+        pulled from the parsed query) ACTUALLY EXISTS as a node in the
+        graph before attempting any traversal. If it doesn't exist,
+        propagation is skipped cleanly — no wasted query, no nonsense
+        "no companies found connected to X" evidence for a candidate
+        entity ("everything", "fine", etc.) that was never a real node
+        to begin with.
+        """
+        if label not in self.START_LABEL_ID_FIELD:
+            return False
+        id_field = self.START_LABEL_ID_FIELD[label]
+        query = f"MATCH (n:{label} {{{id_field}: $id_value}}) RETURN count(n) AS c LIMIT 1"
+        try:
+            rows = self._run(query, {"id_value": id_value})
+        except Exception as e:
+            log.warning(f"node_exists check failed for {label}:{id_value}: {e}")
+            return False
+        return bool(rows and rows[0].get("c", 0) > 0)
+
+    def get_propagation_paths(
+        self,
+        start_label : str,
+        start_id    : str,
+        max_depth   : int = 4,
+        path_limit  : int = 50,
+    ) -> list[dict]:
+        """
+        Search outward from (start_label, start_id) across the relationship
+        types listed in PROPAGATION_REL_TYPES, up to max_depth hops, for
+        every reachable Company node. Returns raw path data — every path
+        found, not just the shortest one per company (multiple independent
+        routes to the same company are meaningfully different evidence,
+        not duplicates to collapse).
+
+        start_label must be one of START_LABEL_ID_FIELD's keys (Input,
+        Geography, Event, Company) — this is validated here rather than
+        left to fail as a malformed Cypher query.
+
+        Capped at path_limit total paths (default 50) with a warning if
+        the search would return more — same discipline as
+        MAX_PAIRS_PER_ENTITY in detect_contradictions.py, so a dense
+        graph region can't silently explode traversal cost.
+        """
+        if start_label not in self.START_LABEL_ID_FIELD:
+            log.warning(f"get_propagation_paths: unknown start_label {start_label!r}")
+            return []
+        if max_depth < 1 or max_depth > 6:
+            log.warning(f"get_propagation_paths: max_depth {max_depth} out of sane range, clamping to 1-6")
+            max_depth = max(1, min(6, max_depth))
+
+        id_field = self.START_LABEL_ID_FIELD[start_label]
+
+        # Undirected traversal (-[...]-) is deliberate: DEPENDS_ON,
+        # SUPPLIES_TO, SOURCED_FROM etc. don't all point the same
+        # semantic direction relative to "impact flow", and dependency
+        # chains are meaningfully traversable in either stored direction
+        # (e.g. Company-DEPENDS_ON->Input is the same real-world fact
+        # whether you're asking "what does this company depend on" or
+        # "what companies depend on this input"). Direction of the
+        # ORIGINAL relationship is preserved per-step in the returned
+        # relationship data (start/end node ids), so nothing is lost —
+        # this only affects which direction Cypher is allowed to walk.
+        query = f"""
+            MATCH (start:{start_label} {{{id_field}: $start_id}})
+            MATCH p = (start)-[rels:{self.PROPAGATION_REL_TYPES}*1..{max_depth}]-(end:Company)
+            WHERE start <> end
+            WITH p, end, length(p) AS depth
+            ORDER BY depth ASC
+            LIMIT $path_limit
+            RETURN
+                end.ticker AS ticker,
+                depth,
+                [n IN nodes(p) | {{
+                    labels: labels(n),
+                    id: coalesce(n.ticker, n.input_id, n.geo_id, n.event_id),
+                    name: coalesce(n.name, n.ticker, n.description)
+                }}] AS path_nodes,
+                [r IN relationships(p) | {{
+                    type: type(r),
+                    start_id: coalesce(startNode(r).ticker, startNode(r).input_id,
+                                        startNode(r).geo_id, startNode(r).event_id),
+                    end_id: coalesce(endNode(r).ticker, endNode(r).input_id,
+                                      endNode(r).geo_id, endNode(r).event_id),
+                    confidence: r.confidence,
+                    criticality: r.criticality,
+                    severity: r.severity,
+                    dependency_level: r.dependency_level,
+                    cost_share: r.cost_share,
+                    percentage: r.percentage
+                }}] AS path_rels
+        """
+
+        try:
+            rows = self._run(query, {"start_id": start_id, "path_limit": path_limit})
+        except Exception as e:
+            log.error(f"get_propagation_paths query failed: {e}")
+            return []
+
+        if len(rows) >= path_limit:
+            log.warning(
+                f"get_propagation_paths hit path_limit ({path_limit}) for "
+                f"start={start_label}:{start_id} — results may be truncated. "
+                f"Consider a smaller max_depth or more specific start node."
+            )
+
+        return rows
