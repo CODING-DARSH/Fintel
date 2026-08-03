@@ -35,7 +35,8 @@ try:
 except Exception:
     # Fallback if config isn't importable in this context — keeps this
     # module usable standalone / in tests without the full project config.
-    SOURCE_TRUST = {"sec_filing": 1.00, "general_news": 0.60}
+    SOURCE_TRUST = {"sec_filing": 1.00, "general_news": 0.60,
+                     "market_data": 0.85, "macro_data": 0.75}
 
 
 # ---------------------------------------------------------------------------
@@ -70,17 +71,49 @@ def _run_graph(graph: GraphRetriever, pq) -> list:
 # Evidence scoring helpers
 # ---------------------------------------------------------------------------
 
+# Maps GraphRetriever's granular result_type (set per-method in
+# graph_retriever.py, e.g. "news_mention", "macro_impact") to the
+# SOURCE_TRUST key that actually reflects where that data came from.
+# BUG THIS FIXES: _reliability_for previously always returned
+# SOURCE_TRUST["sec_filing"] for every graph result, regardless of
+# whether it actually originated from a filing-derived node (Risk,
+# Input via DEPENDS_ON) or a connector-derived node (NewsArticle,
+# MacroSignal, MarketSignal) — meaning news-sourced evidence was being
+# scored with SEC-filing-grade reliability every single time, silently
+# defeating the whole point of having differentiated SOURCE_TRUST
+# values. Only became visible as a real problem once news/macro data
+# actually started flowing into the graph in volume.
+GRAPH_RESULT_TYPE_TRUST = {
+    "company_risk"           : "sec_filing",
+    "shared_risk"            : "sec_filing",
+    "supply_chain_dependency": "sec_filing",
+    "propagation_risk"       : "sec_filing",
+    "competitor"             : "sec_filing",
+    "causal_chain"           : "sec_filing",
+    "executive_change"       : "sec_filing",
+    "geographic_exposure"    : "sec_filing",
+    "macro_impact"           : "macro_data",
+    "market_signal"          : "market_data",
+    "news_mention"           : "general_news",
+}
+
+
 def _reliability_for(merged_result) -> float:
     """
-    Reliability by source type, using config.SOURCE_TRUST where possible.
-    Graph results are treated as sec_filing-grade (they're derived from
-    filings/macro/news already curated into the graph). Vector results
-    use sec_filing trust since chunks come from filings; news_connector-
-    sourced text should carry its own source tag once that metadata is
-    available on MergedResult (not yet — flagged, not guessed at).
+    Reliability by ACTUAL source type. Vector results are always filing
+    chunks (VectorRetriever only ever indexes data/extracted/ chunk
+    text — confirmed by embedder.py/chunker.py), so sec_filing is
+    correct there. Graph results now look up the granular result_type
+    (news_mention, macro_impact, etc.) via GRAPH_RESULT_TYPE_TRUST
+    instead of assuming sec_filing for everything — that assumption was
+    silently wrong for any graph evidence sourced from a connector
+    rather than a filing.
     """
     if merged_result.result_type == "graph":
-        return SOURCE_TRUST.get("sec_filing", 0.9)
+        src = merged_result.sources[0] if merged_result.sources else {}
+        granular_type = src.get("result_type", "")
+        trust_key = GRAPH_RESULT_TYPE_TRUST.get(granular_type, "sec_filing")
+        return SOURCE_TRUST.get(trust_key, 0.9)
     return SOURCE_TRUST.get("sec_filing", 1.0)
 
 
