@@ -161,18 +161,33 @@ def upsert_person(name: str, role: str, company: str) -> str:
     return person_id
 
 
-def upsert_risk(category: str, subcategory: str, description: str) -> str:
+def upsert_risk(category: str, subcategory: str, description: str, ticker: str = None) -> str:
+    """
+    risk_id is scoped by ticker, not just category+subcategory. Without
+    this, two different companies whose filings produced the same
+    generic category/subcategory (very common — e.g. "financial_risk"/
+    "taxation" recurs across nearly every company) MERGE onto the exact
+    same Risk node, silently overwriting each other's descriptions and
+    leaving EVERY company that was ever EXPOSED_TO that category/
+    subcategory connected to whichever company's text loaded last.
+    Confirmed happening in practice: TSLA showed EXPOSED_TO a risk whose
+    description was verbatim NVIDIA's tax disclosure, and another whose
+    description was about Nike's Converse brand.
+    """
     if not category:
         return None
-    risk_id = f"{category}_{subcategory or 'general'}".lower().replace(" ", "_")
+    scope = (ticker or "general").lower()
+    risk_id = f"{scope}_{category}_{subcategory or 'general'}".lower().replace(" ", "_")
     run_query("""
         MERGE (r:Risk {risk_id: $risk_id})
         ON CREATE SET r.category = $category, r.subcategory = $subcategory,
-                      r.description = $description, r.created_at = timestamp()
+                      r.description = $description, r.ticker = $ticker,
+                      r.created_at = timestamp()
         ON MATCH SET r.description = CASE WHEN $description IS NOT NULL
                      THEN $description ELSE r.description END
     """, {"risk_id": risk_id, "category": category,
-          "subcategory": subcategory, "description": description})
+          "subcategory": subcategory, "description": description,
+          "ticker": ticker})
     return risk_id
 
 
@@ -401,7 +416,7 @@ def load_chunk(chunk: dict, filing_date: str):
         conf   = risk.get("confidence", 0.7)
         if not cat:
             continue
-        rid = upsert_risk(cat, subcat, desc)
+        rid = upsert_risk(cat, subcat, desc, ticker=ticker)
         create_relation("Company", "ticker", ticker,
                         "Risk", "risk_id", rid,
                         "EXPOSED_TO", {
@@ -616,7 +631,7 @@ def load_chunk(chunk: dict, filing_date: str):
         conf        = hedge.get("confidence", 0.7)
         if not risk_hedged:
             continue
-        rid = upsert_risk(f"hedged_{risk_hedged}", specific, specific)
+        rid = upsert_risk(f"hedged_{risk_hedged}", specific, specific, ticker=ticker)
         create_relation("Company", "ticker", ticker,
                         "Risk", "risk_id", rid,
                         "HEDGES", {

@@ -983,3 +983,5 @@ if __name__ == "__main__":
         print(f"--- Item {iid} ({len(text.split())} words) ---")
         print(text[:200] + "...")
         print()
+        
+#docker compose run --rm pipeline python src/test_8k.py

@@ -31,7 +31,7 @@ DB_URL      = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT
 
 # ── Groq (LLM) ────────────────────────────────────────────────────────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL   = os.getenv("GROQ_MODEL",   "llama-3.1-8b-instant")
+GROQ_MODEL   = os.getenv("GROQ_MODEL",   "llama-3.3-70b-versatile")
 # Swap to llama-3.1-70b-versatile for harder reasoning tasks
 # Swap to mixtral-8x7b-32768 for long-context filing analysis
 
@@ -132,6 +132,47 @@ SOURCE_TRUST = {
     "general_news"  : 0.60,
     "reddit"        : 0.30,
     "twitter"       : 0.25, 
+    # Added for graph evidence sourced from connectors rather than SEC
+    # filings — previously ALL graph evidence was silently scored as
+    # sec_filing regardless of actual origin (see gather_evidence.py's
+    # GRAPH_RESULT_TYPE_TRUST). Uncalibrated like the propagation
+    # weights — reasonable priors, not measured. market_data is higher
+    # than macro_data since it's the company's own real-time price/
+    # volume data (less room for interpretation) vs. macro signals
+    # which involve more indirect sector-mapping judgment calls.
+    "market_data"   : 0.85,
+    "macro_data"    : 0.75,
+}
+
+# ── Graph propagation edge weights (src/agents/analytics/graph_propagation.py) ─
+# UNCALIBRATED PLACEHOLDER — these numbers are reasonable-looking guesses,
+# not derived from any historical outcome data. Do not treat scores computed
+# from these as predictive; they express "documented connection strength
+# given available disclosures," nothing more. Revisit once propagation has
+# been run against real cases where the actual outcome is known (e.g. did a
+# supplier disruption measurably affect the dependent company), and the
+# numbers can be checked against something real rather than asserted.
+#
+# Resolution priority for any given edge (see graph_propagation.py):
+#   1. A real numeric field on the edge itself (percentage, cost_share)
+#   2. This categorical mapping, keyed by whichever categorical field
+#      the edge actually has (criticality / severity / dependency_level)
+#   3. PROPAGATION_RELATION_DEFAULTS below, keyed by relationship type
+PROPAGATION_CATEGORICAL_WEIGHTS = {
+    "high"  : 0.85,
+    "medium": 0.5,
+    "low"   : 0.2,
+}
+
+# Fallback when an edge has neither a numeric field nor a categorical
+# field populated at all. Also uncalibrated.
+PROPAGATION_RELATION_DEFAULTS = {
+    "DEPENDS_ON"    : 0.5,
+    "SUPPLIES_TO"   : 0.5,
+    "SOURCED_FROM"  : 0.6,
+    "EXPOSED_TO"    : 0.5,
+    "PROPAGATES_TO" : 0.6,
+    "BUYS_FROM"     : 0.4,
 }
 
 # ── Embedding model (local, no API key needed) ────────────────────────────────

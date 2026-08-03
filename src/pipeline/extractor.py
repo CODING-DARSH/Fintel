@@ -34,6 +34,7 @@ CHUNKS_DIR    = Path("data/chunks")
 EXTRACTED_DIR = Path("data/extracted")
 
 HIGH_VALUE_SECTIONS = {
+    "1",
     "1A", "7", "7A",
     "2.02", "5.02", "1.01", "8.01", "7.01",
 }
@@ -45,7 +46,7 @@ TICKERS = [
     "AAPL","MSFT","GOOGL","NVDA","META","ADBE","CRM","INTC","CSCO","IBM",
 ]
 
-RETRY_DELAY   = 25
+RETRY_DELAY   = 10
 REQUEST_DELAY = 1.0
 MAX_ATTEMPTS  = 6
 
@@ -99,7 +100,7 @@ def _call_gemini(key: str, prompt: str) -> str:
 
     client = genai.Client(api_key=key)
     response = client.models.generate_content(
-        model="gemini-3.5-flash",
+        model="gemini-3.6-flash",
         contents=prompt,
         config=types.GenerateContentConfig(
             system_instruction=(
