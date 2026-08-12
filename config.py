@@ -27,7 +27,19 @@ DB_PASSWORD = os.getenv("POSTGRES_PASSWORD", "fintel_dev_password")
 DB_HOST     = os.getenv("POSTGRES_HOST",     "localhost")
 DB_PORT     = os.getenv("POSTGRES_PORT",     "5432")
 DB_NAME     = os.getenv("POSTGRES_DB",       "fintel")
-DB_URL      = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
+# Neon (and most managed Postgres) requires SSL — local Docker Postgres
+# doesn't need it and ignores the param harmlessly either way, so this
+# is safe to always include rather than branching on host.
+# channel_binding=require matches what Neon's own connection string
+# includes by default; sslmode=require is the minimum SSL enforcement.
+DB_SSLMODE  = os.getenv("POSTGRES_SSLMODE",  "require")
+DB_CHANNEL_BINDING = os.getenv("POSTGRES_CHANNEL_BINDING", "")
+
+DB_URL = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}?sslmode={DB_SSLMODE}"
+if DB_CHANNEL_BINDING:
+    DB_URL += f"&channel_binding={DB_CHANNEL_BINDING}"
+
 
 # ── Groq (LLM) ────────────────────────────────────────────────────────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")

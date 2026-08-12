@@ -30,6 +30,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(message)s")
 log = logging.getLogger(__name__)
 
 NEO4J_HOST     = os.getenv("NEO4J_HOST", "localhost")
+NEO4J_URI      = os.getenv("NEO4J_URI", "")
 NEO4J_PORT     = int(os.getenv("NEO4J_PORT", "7687"))
 NEO4J_USER     = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
@@ -88,7 +89,7 @@ def get_neo4j():
     if _driver is None:
         from neo4j import GraphDatabase
         _driver = GraphDatabase.driver(
-            f"bolt://{NEO4J_HOST}:{NEO4J_PORT}",
+            NEO4J_URI if NEO4J_URI else f"bolt://{NEO4J_HOST}:{NEO4J_PORT}",
             auth=(NEO4J_USER, NEO4J_PASSWORD)
         )
     return _driver
