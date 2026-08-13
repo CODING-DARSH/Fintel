@@ -1,42 +1,3 @@
-# =============================================================================
-# src/pipeline/graph_loader.py
-# =============================================================================
-# Step 5 of extraction pipeline.
-# Reads data/extracted/TICKER/*.json
-# Loads all entities, relations, and signals into Neo4j knowledge graph
-#
-# NODE TYPES:
-#   Company           — ticker, name, sector
-#   Person            — name, role, company
-#   Risk              — category, subcategory, description
-#   Event             — type, date, description
-#   Market            — name, geography
-#   Product           — name, company
-#   Input             — commodity/component name
-#   Geography         — country/region
-#   FilingChunk       — chunk_id, filing_id, section, date
-#
-# RELATIONSHIP TYPES:
-#   COMPETES_WITH     — Company → Company
-#   SUPPLIES_TO       — Company → Company
-#   BUYS_FROM         — Company → Company
-#   DEPENDS_ON        — Company → Input
-#   EXPOSED_TO        — Company → Risk
-#   CAUSED            — Risk/Event → Risk/Event
-#   IMPACTED_BY       — Company → Event
-#   MENTIONED_IN      — Entity → FilingChunk (source tracing)
-#   LED_BY            — Company → Person
-#   OPERATES_IN       — Company → Market
-#   HEDGES            — Company → Risk
-#   LITIGATES_AGAINST — Company → Company/Regulator
-#   PROPAGATES_TO     — Risk → Company (supply chain propagation)
-#   HAS_CONCENTRATION — Company → Input/Company (concentration risk)
-#
-# Usage:
-#   python src/pipeline/graph_loader.py            # all tickers
-#   python src/pipeline/graph_loader.py AAPL MSFT  # specific tickers
-#   python src/pipeline/graph_loader.py --clear    # wipe graph first
-
 import sys
 import json
 import logging
@@ -53,6 +14,7 @@ NEO4J_HOST     = os.getenv("NEO4J_HOST", "localhost")
 NEO4J_PORT     = int(os.getenv("NEO4J_PORT", "7687"))
 NEO4J_USER     = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
+NEO4J_URI      = os.getenv("NEO4J_URI", "")
 
 TICKERS = [
     "AMZN","TSLA","HD","MCD","NKE","SBUX","TGT","LOW","BKNG","GM",
@@ -61,16 +23,13 @@ TICKERS = [
     "AAPL","MSFT","GOOGL","NVDA","META","ADBE","CRM","INTC","CSCO","IBM",
 ]
 
-# ---------------------------------------------------------------------------
-# Neo4j driver
-# ---------------------------------------------------------------------------
 _driver = None
 
 def get_driver():
     global _driver
     if _driver is None:
         from neo4j import GraphDatabase
-        uri = f"bolt://{NEO4J_HOST}:{NEO4J_PORT}"
+        uri = NEO4J_URI if NEO4J_URI else f"bolt://{NEO4J_HOST}:{NEO4J_PORT}"
         log.info(f"Connecting to Neo4j at {uri}...")
         _driver = GraphDatabase.driver(uri, auth=(NEO4J_USER, NEO4J_PASSWORD))
         _driver.verify_connectivity()
@@ -84,10 +43,6 @@ def run_query(query: str, params: dict = None):
         result = session.run(query, params or {})
         return result.data()
 
-
-# ---------------------------------------------------------------------------
-# Schema setup — constraints and indexes for fast lookups
-# ---------------------------------------------------------------------------
 
 CONSTRAINTS = [
     "CREATE CONSTRAINT company_ticker IF NOT EXISTS FOR (c:Company) REQUIRE c.ticker IS UNIQUE",
@@ -132,12 +87,7 @@ def clear_graph():
     log.info("Graph cleared.")
 
 
-# ---------------------------------------------------------------------------
-# Node creation helpers — MERGE prevents duplicates
-# ---------------------------------------------------------------------------
-
 def upsert_company(ticker: str, name: str = None) -> str:
-    """Create or update a Company node. Returns ticker."""
     if not ticker:
         return None
     run_query("""
@@ -162,18 +112,6 @@ def upsert_person(name: str, role: str, company: str) -> str:
 
 
 def upsert_risk(category: str, subcategory: str, description: str, ticker: str = None) -> str:
-    """
-    risk_id is scoped by ticker, not just category+subcategory. Without
-    this, two different companies whose filings produced the same
-    generic category/subcategory (very common — e.g. "financial_risk"/
-    "taxation" recurs across nearly every company) MERGE onto the exact
-    same Risk node, silently overwriting each other's descriptions and
-    leaving EVERY company that was ever EXPOSED_TO that category/
-    subcategory connected to whichever company's text loaded last.
-    Confirmed happening in practice: TSLA showed EXPOSED_TO a risk whose
-    description was verbatim NVIDIA's tax disclosure, and another whose
-    description was about Nike's Converse brand.
-    """
     if not category:
         return None
     scope = (ticker or "general").lower()
@@ -264,10 +202,6 @@ def upsert_event(event_id: str, event_type: str, description: str,
     return event_id
 
 
-# ---------------------------------------------------------------------------
-# Relationship creation helpers
-# ---------------------------------------------------------------------------
-
 def create_relation(from_label: str, from_id_field: str, from_id: str,
                     to_label: str, to_id_field: str, to_id: str,
                     rel_type: str, props: dict = None):
@@ -290,12 +224,7 @@ def create_relation(from_label: str, from_id_field: str, from_id: str,
         log.debug(f"Relation {rel_type} {from_id}→{to_id}: {e}")
 
 
-# ---------------------------------------------------------------------------
-# Extraction loading — one chunk at a time
-# ---------------------------------------------------------------------------
-
 def load_chunk(chunk: dict, filing_date: str):
-    """Load all extracted knowledge from one chunk into Neo4j."""
     ticker   = chunk.get("ticker", "").upper()
     chunk_id = chunk.get("chunk_id")
     ext      = chunk.get("extraction", {})
@@ -303,21 +232,15 @@ def load_chunk(chunk: dict, filing_date: str):
     if not ticker or not ext:
         return
 
-    # Ensure the filing company node exists
     upsert_company(ticker)
-
-    # Ensure the chunk node exists
     upsert_chunk(chunk)
 
-    # Link company to its filing chunk
     create_relation("Company", "ticker", ticker,
                     "FilingChunk", "chunk_id", chunk_id,
                     "HAS_CHUNK", {"filing_date": filing_date})
 
-    # ── Entities ──────────────────────────────────────────────────────────
     entities = ext.get("entities", {})
 
-    # Companies mentioned
     for company in entities.get("companies", []):
         name   = company.get("name")
         ctick  = company.get("ticker", "").upper() if company.get("ticker") else None
@@ -331,13 +254,11 @@ def load_chunk(chunk: dict, filing_date: str):
         if ctick:
             upsert_company(ctick, name)
         else:
-            # Create a company node without ticker
             run_query("""
                 MERGE (c:Company {ticker: $ticker})
                 ON CREATE SET c.name = $name, c.created_at = timestamp()
             """, {"ticker": node_id, "name": name})
 
-        # Create relationship based on role
         rel_map = {
             "competitor"  : "COMPETES_WITH",
             "supplier"    : "SUPPLIES_TO",
@@ -374,12 +295,10 @@ def load_chunk(chunk: dict, filing_date: str):
                                 {"context": ctx, "source_chunk": chunk_id,
                                  "filing_date": filing_date})
 
-        # MENTIONED_IN → chunk for source tracing
         create_relation("Company", "ticker", node_id,
                         "FilingChunk", "chunk_id", chunk_id,
                         "MENTIONED_IN", {"role": role, "filing_date": filing_date})
 
-    # People
     for person in entities.get("people", []):
         name    = person.get("name")
         role    = person.get("role", "")
@@ -393,21 +312,18 @@ def load_chunk(chunk: dict, filing_date: str):
                         {"role": role, "source_chunk": chunk_id,
                          "filing_date": filing_date})
 
-    # Markets
     for market in entities.get("markets", []):
         mid = upsert_market(market)
         create_relation("Company", "ticker", ticker,
                         "Market", "market_id", mid,
                         "OPERATES_IN", {"source_chunk": chunk_id})
 
-    # Geographies
     for geo in entities.get("geographies", []):
         gid = upsert_geography(geo)
         create_relation("Company", "ticker", ticker,
                         "Geography", "geo_id", gid,
                         "PRESENT_IN", {"source_chunk": chunk_id})
 
-    # ── Risk signals ──────────────────────────────────────────────────────
     for risk in ext.get("risk_signals", []):
         cat    = risk.get("category")
         subcat = risk.get("subcategory", "general")
@@ -428,7 +344,6 @@ def load_chunk(chunk: dict, filing_date: str):
                             "filing_date"    : filing_date,
                         })
 
-    # ── Relations from extractor ──────────────────────────────────────────
     for rel in ext.get("relations", []):
         from_e = rel.get("from", "").upper()
         to_e   = rel.get("to", "").upper()
@@ -440,7 +355,6 @@ def load_chunk(chunk: dict, filing_date: str):
         if not from_e or not to_e:
             continue
 
-        # Ensure both nodes exist as companies if they look like tickers
         if len(from_e) <= 6:
             upsert_company(from_e)
         if len(to_e) <= 6:
@@ -457,9 +371,8 @@ def load_chunk(chunk: dict, filing_date: str):
                                 "filing_date" : filing_date,
                             })
         except Exception:
-            pass  # May fail if to_e is a risk/event not a company
+            pass
 
-    # ── Causal chains ────────────────────────────────────────────────────
     for chain in ext.get("causal_chains", []):
         cause     = chain.get("cause", "")
         effect    = chain.get("effect", "")
@@ -487,7 +400,6 @@ def load_chunk(chunk: dict, filing_date: str):
                             "filing_date" : filing_date,
                         })
 
-        # Link affected entity to effect
         create_relation("Company", "ticker", entity,
                         "Event", "event_id", effect_id,
                         "IMPACTED_BY", {
@@ -496,7 +408,6 @@ def load_chunk(chunk: dict, filing_date: str):
                             "filing_date" : filing_date,
                         })
 
-    # ── Dependency chains ─────────────────────────────────────────────────
     for dep_chain in ext.get("dependency_chains", []):
         entity = dep_chain.get("ticker", ticker).upper() or ticker
         upsert_company(entity)
@@ -519,7 +430,6 @@ def load_chunk(chunk: dict, filing_date: str):
                                 "filing_date"      : filing_date,
                             })
 
-            # Link suppliers of this input
             for supplier in dep.get("suppliers_named", []):
                 sup_id = supplier.upper().replace(" ", "_")
                 upsert_company(sup_id, supplier)
@@ -530,7 +440,6 @@ def load_chunk(chunk: dict, filing_date: str):
                                     "filing_date" : filing_date,
                                 })
 
-            # Link supplier geographies
             for geo in dep.get("supplier_geographies", []):
                 geo_id = upsert_geography(geo)
                 create_relation("Input", "input_id", inp_id,
@@ -540,21 +449,18 @@ def load_chunk(chunk: dict, filing_date: str):
                                     "filing_date" : filing_date,
                                 })
 
-    # ── Propagation risks ─────────────────────────────────────────────────
     for prop in ext.get("propagation_risks", []):
         trigger_type = prop.get("trigger_event_type", "unknown")
         trigger_geo  = prop.get("trigger_geography")
         input_aff    = prop.get("input_affected")
         conf         = prop.get("confidence", 0.7)
 
-        # Create trigger event node
         event_id = (f"trigger_{trigger_type}_{trigger_geo or 'global'}"
                     .lower().replace(" ", "_"))
         upsert_event(event_id, trigger_type,
                      f"{trigger_type} in {trigger_geo or 'global'}",
                      geography=trigger_geo, filing_date=filing_date)
 
-        # Link trigger to affected input
         if input_aff:
             inp_id = upsert_input(input_aff)
             create_relation("Event", "event_id", event_id,
@@ -565,7 +471,6 @@ def load_chunk(chunk: dict, filing_date: str):
                                 "filing_date" : filing_date,
                             })
 
-        # First order impact
         first = prop.get("first_order_impact", {})
         first_ticker = (first.get("ticker") or "").upper()
         if first_ticker:
@@ -582,7 +487,6 @@ def load_chunk(chunk: dict, filing_date: str):
                                 "filing_date" : filing_date,
                             })
 
-        # Second order impact
         second = prop.get("second_order_impact", {})
         second_ticker = (second.get("ticker") or "").upper()
         if second_ticker:
@@ -599,7 +503,6 @@ def load_chunk(chunk: dict, filing_date: str):
                                 "filing_date" : filing_date,
                             })
 
-    # ── Concentration disclosures ─────────────────────────────────────────
     for conc in ext.get("concentration_disclosures", []):
         ctype  = conc.get("type", "unknown")
         entity = conc.get("entity_named")
@@ -624,7 +527,6 @@ def load_chunk(chunk: dict, filing_date: str):
                                 "filing_date"        : filing_date,
                             })
 
-    # ── Hedging signals ───────────────────────────────────────────────────
     for hedge in ext.get("hedging_signals", []):
         risk_hedged = hedge.get("risk_being_hedged")
         specific    = hedge.get("specific_risk", "")
@@ -642,7 +544,6 @@ def load_chunk(chunk: dict, filing_date: str):
                             "filing_date" : filing_date,
                         })
 
-    # ── Litigation signals ────────────────────────────────────────────────
     for lit in ext.get("litigation_signals", []):
         plaintiff = lit.get("plaintiff")
         defendant = lit.get("defendant")
@@ -672,7 +573,6 @@ def load_chunk(chunk: dict, filing_date: str):
                                 "filing_date" : filing_date,
                             })
 
-    # ── Geographic concentrations ─────────────────────────────────────────
     for geo_conc in ext.get("geographic_concentrations", []):
         location = geo_conc.get("concentrated_in")
         if not location:
@@ -689,10 +589,6 @@ def load_chunk(chunk: dict, filing_date: str):
                             "filing_date"       : filing_date,
                         })
 
-
-# ---------------------------------------------------------------------------
-# File / ticker / main
-# ---------------------------------------------------------------------------
 
 def process_filing(extracted_path: Path) -> dict:
     data        = json.load(open(extracted_path))
@@ -756,7 +652,6 @@ def main():
         results.append(r)
         total_loaded += r["total_loaded"]
 
-    # Graph stats
     node_count = run_query("MATCH (n) RETURN count(n) as count")[0]["count"]
     rel_count  = run_query("MATCH ()-[r]->() RETURN count(r) as count")[0]["count"]
 

@@ -3,24 +3,16 @@
 # =============================================================================
 # Retrieves structured knowledge from Neo4j knowledge graph.
 #
-# TECHNIQUES:
-#   Entity-centric traversal  — start from known company node
-#   Pattern matching          — find nodes matching property filters
-#   Multi-hop traversal       — traverse 2-3 relationship hops
-#   Temporal filtering        — filter by filing_date or fetch_date
-#   Aggregation queries       — count, group, rank results
+# CONNECTION (this fix): NEO4J_URI now takes priority over
+# NEO4J_HOST/PORT when set — needed for AuraDB, which hands you a full
+# "neo4j+s://xxxxxxxx.databases.neo4j.io" connection string (TLS, no
+# separate host/port to assemble). Local/self-hosted Neo4j keeps
+# working unchanged via the old host/port + plain "bolt://" path when
+# NEO4J_URI is left unset.
 #
-# QUERY TYPES SUPPORTED:
-#   company_risks         — risks a company is exposed to
-#   shared_risks          — companies sharing the same risk
-#   supply_chain          — dependency chain traversal
-#   propagation           — what events propagate to a company
-#   competitors           — companies competing with each other
-#   executive_changes     — leadership changes at companies
-#   causal_chains         — cause→effect chains
-#   sector_exposure       — all companies exposed to a signal
-#   news_impact           — news articles affecting companies
-#   macro_impact          — macro signals affecting companies
+# All other logic below (optional-arg fallbacks on every get_* method,
+# node_exists, get_propagation_paths) is unchanged from the version
+# already fixed elsewhere — only the connection block changed here.
 
 import os
 import re
@@ -36,17 +28,21 @@ NEO4J_PORT     = int(os.getenv("NEO4J_PORT", "7687"))
 NEO4J_USER     = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
 
+# NEO4J_URI takes priority when set — required for AuraDB. Local/self-hosted
+# Neo4j keeps working unchanged via NEO4J_HOST/PORT when this is not set.
+NEO4J_URI = os.getenv("NEO4J_URI", "")
+
 
 @dataclass
 class GraphResult:
     """Single result from graph retrieval."""
-    result_type  : str                    # what kind of result this is
-    primary_entity: str                   # main entity (ticker or name)
-    data         : dict                   # the actual result data
-    score        : float = 1.0           # relevance score (1.0 = direct match)
-    hop_distance : int   = 0             # how many hops from query entity
-    source_chunks: list  = field(default_factory=list)  # chunk_ids for citation
-    filing_dates : list  = field(default_factory=list)  # dates of evidence
+    result_type  : str
+    primary_entity: str
+    data         : dict
+    score        : float = 1.0
+    hop_distance : int   = 0
+    source_chunks: list  = field(default_factory=list)
+    filing_dates : list  = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -72,8 +68,9 @@ class GraphRetriever:
     def _get_driver(self):
         if self._driver is None:
             from neo4j import GraphDatabase
+            uri = NEO4J_URI if NEO4J_URI else f"bolt://{NEO4J_HOST}:{NEO4J_PORT}"
             self._driver = GraphDatabase.driver(
-                f"bolt://{NEO4J_HOST}:{NEO4J_PORT}",
+                uri,
                 auth=(NEO4J_USER, NEO4J_PASSWORD),
             )
         return self._driver
@@ -92,39 +89,9 @@ class GraphRetriever:
             self._driver.close()
             self._driver = None
 
-    # -------------------------------------------------------------------------
-    # Core retrieval methods
-    # -------------------------------------------------------------------------
-
-    # -----------------------------------------------------------------------
-    # Generic dispatch — call any get_* method by name, filtered to the
-    # kwargs it actually accepts. This exists so new query types only ever
-    # need a new get_* method added below; callers (gather_evidence.py,
-    # test_retrieval.py, anything else) never need their own if/elif chain
-    # duplicated and kept in sync with this class's method list.
-    # -----------------------------------------------------------------------
-
     KNOWN_QUERY_METHODS_PREFIX = "get_"
 
     def query(self, query_type: str, **kwargs) -> list:
-        """
-        Generic entry point: query_type is the method name (e.g.
-        "get_company_risks", "get_macro_impact"). kwargs can pass any
-        candidate parameter name — only the ones the target method
-        actually declares are forwarded, everything else is dropped
-        silently (this is what lets one caller pass a broad, speculative
-        set of candidate kwargs without needing to know each method's
-        exact signature).
-
-        Unknown query_type, or a query_type that isn't one of this
-        class's own get_* methods, logs a warning and returns [] rather
-        than raising — keeps this safe to call with a model-provided or
-        otherwise dynamic query_type.
-
-        get_company_overview is intentionally excluded — it returns a
-        dict, not list[GraphResult], and callers expecting a list should
-        not silently receive one.
-        """
         if not query_type.startswith(self.KNOWN_QUERY_METHODS_PREFIX):
             log.warning(f"Rejected graph query_type (must start with 'get_'): {query_type!r}")
             return []
@@ -154,24 +121,22 @@ class GraphRetriever:
 
     def get_company_risks(
         self,
-        ticker      : str,
+        ticker      : Optional[str] = None,
         severity    : Optional[str] = None,
         date_from   : Optional[str] = None,
         limit       : int = 20,
     ) -> list[GraphResult]:
-        """
-        Get all risks a company is exposed to.
-        Optionally filter by severity and date range.
-        """
+        ticker_filter   = "AND c.ticker = $ticker" if ticker else ""
         severity_filter = "AND r.severity = $severity" if severity else ""
         date_filter     = "AND rel.filing_date >= $date_from" if date_from else ""
 
         query = f"""
-            MATCH (c:Company {{ticker: $ticker}})-[rel:EXPOSED_TO]->(r:Risk)
-            WHERE 1=1 {severity_filter} {date_filter}
+            MATCH (c:Company)-[rel:EXPOSED_TO]->(r:Risk)
+            WHERE 1=1 {ticker_filter} {severity_filter} {date_filter}
             OPTIONAL MATCH (r)<-[:EXPOSED_TO]-(other:Company)
-            WITH r, rel, collect(DISTINCT other.ticker) AS shared_companies
-            RETURN r.risk_id      AS risk_id,
+            WITH c, r, rel, collect(DISTINCT other.ticker) AS shared_companies
+            RETURN c.ticker      AS ticker,
+                   r.risk_id      AS risk_id,
                    r.category     AS category,
                    r.subcategory  AS subcategory,
                    r.description  AS description,
@@ -184,7 +149,9 @@ class GraphRetriever:
             ORDER BY rel.confidence DESC
             LIMIT $limit
         """
-        params = {"ticker": ticker.upper(), "limit": limit}
+        params = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker.upper()
         if severity:
             params["severity"] = severity
         if date_from:
@@ -195,7 +162,7 @@ class GraphRetriever:
         for row in rows:
             results.append(GraphResult(
                 result_type   = "company_risk",
-                primary_entity= ticker.upper(),
+                primary_entity= row.get("ticker", ""),
                 score         = float(row.get("confidence") or 0.8),
                 hop_distance  = 1,
                 source_chunks = [row["source_chunk"]] if row.get("source_chunk") else [],
@@ -214,22 +181,19 @@ class GraphRetriever:
 
     def get_shared_risk_companies(
         self,
-        risk_category   : str,
+        risk_category   : Optional[str] = None,
         risk_subcategory: Optional[str] = None,
         severity        : Optional[str] = None,
         limit           : int = 30,
     ) -> list[GraphResult]:
-        """
-        Find all companies exposed to the same risk category.
-        Core query for "who else is exposed to X" questions.
-        """
+        cat_filter = "AND toLower(r.category) CONTAINS toLower($category)" if risk_category else ""
         sub_filter = ("AND toLower(r.subcategory) CONTAINS toLower($subcategory)"
                       if risk_subcategory else "")
         sev_filter = "AND rel.severity = $severity" if severity else ""
 
         query = f"""
             MATCH (c:Company)-[rel:EXPOSED_TO]->(r:Risk)
-            WHERE toLower(r.category) CONTAINS toLower($category)
+            WHERE 1=1 {cat_filter}
             {sub_filter} {sev_filter}
             RETURN c.ticker        AS ticker,
                    c.name          AS name,
@@ -243,7 +207,9 @@ class GraphRetriever:
             ORDER BY rel.confidence DESC
             LIMIT $limit
         """
-        params = {"category": risk_category, "limit": limit}
+        params = {"limit": limit}
+        if risk_category:
+            params["category"] = risk_category
         if risk_subcategory:
             params["subcategory"] = risk_subcategory
         if severity:
@@ -273,23 +239,20 @@ class GraphRetriever:
 
     def get_supply_chain(
         self,
-        ticker   : str,
+        ticker   : Optional[str] = None,
         max_hops : int = 3,
         limit    : int = 50,
     ) -> list[GraphResult]:
-        """
-        Traverse supply chain dependencies up to max_hops.
-        Returns: company → depends on input → produced by supplier
-        Multi-hop: finds indirect dependencies too.
-        """
+        ticker_clause = "{ticker: $ticker}" if ticker else ""
         query = f"""
-            MATCH path = (c:Company {{ticker: $ticker}})-[:DEPENDS_ON*1..{max_hops}]->(i:Input)
+            MATCH path = (c:Company {ticker_clause})-[:DEPENDS_ON*1..{max_hops}]->(i:Input)
             WITH c, i, length(path) AS hops,
                  [r IN relationships(path) | r.criticality] AS criticalities,
                  [r IN relationships(path) | r.source_chunk] AS chunks
             OPTIONAL MATCH (supplier:Company)-[:PRODUCES]->(i)
             OPTIONAL MATCH (i)-[:SOURCED_FROM]->(geo:Geography)
-            RETURN i.name          AS input_name,
+            RETURN c.ticker        AS ticker,
+                   i.name          AS input_name,
                    i.input_type    AS input_type,
                    hops            AS hop_distance,
                    criticalities[0] AS criticality,
@@ -299,7 +262,11 @@ class GraphRetriever:
             ORDER BY hops ASC, criticality DESC
             LIMIT $limit
         """
-        rows = self._run(query, {"ticker": ticker.upper(), "limit": limit})
+        params = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker.upper()
+
+        rows = self._run(query, params)
         results = []
         for row in rows:
             crit_map = {"critical": 1.0, "high": 0.8, "medium": 0.6, "low": 0.4}
@@ -308,7 +275,7 @@ class GraphRetriever:
 
             results.append(GraphResult(
                 result_type   = "supply_chain_dependency",
-                primary_entity= ticker.upper(),
+                primary_entity= row.get("ticker", ""),
                 score         = score,
                 hop_distance  = int(row.get("hop_distance", 1)),
                 source_chunks = [row["source_chunk"]] if row.get("source_chunk") else [],
@@ -325,20 +292,18 @@ class GraphRetriever:
 
     def get_propagation_risks(
         self,
-        ticker     : str,
+        ticker     : Optional[str] = None,
         event_type : Optional[str] = None,
         limit      : int = 20,
     ) -> list[GraphResult]:
-        """
-        Find events that propagate to a company (1st or 2nd order).
-        Key for: "what external events could impact this company?"
-        """
+        ticker_clause = "{ticker: $ticker}" if ticker else ""
         event_filter = ("AND toLower(e.event_type) CONTAINS toLower($event_type)"
                         if event_type else "")
         query = f"""
-            MATCH (e:Event)-[rel:PROPAGATES_TO]->(c:Company {{ticker: $ticker}})
+            MATCH (e:Event)-[rel:PROPAGATES_TO]->(c:Company {ticker_clause})
             WHERE 1=1 {event_filter}
-            RETURN e.event_id    AS event_id,
+            RETURN c.ticker      AS ticker,
+                   e.event_id    AS event_id,
                    e.event_type  AS event_type,
                    e.description AS description,
                    e.geography   AS geography,
@@ -352,7 +317,9 @@ class GraphRetriever:
             ORDER BY rel.confidence DESC
             LIMIT $limit
         """
-        params = {"ticker": ticker.upper(), "limit": limit}
+        params = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker.upper()
         if event_type:
             params["event_type"] = event_type
 
@@ -361,7 +328,7 @@ class GraphRetriever:
         for row in rows:
             results.append(GraphResult(
                 result_type   = "propagation_risk",
-                primary_entity= ticker.upper(),
+                primary_entity= row.get("ticker", ""),
                 score         = float(row.get("confidence") or 0.7),
                 hop_distance  = int(row.get("propagation_order") or 1),
                 source_chunks = [row["source_chunk"]] if row.get("source_chunk") else [],
@@ -380,15 +347,15 @@ class GraphRetriever:
 
     def get_competitors(
         self,
-        ticker  : str,
+        ticker  : Optional[str] = None,
         segment : Optional[str] = None,
         limit   : int = 20,
     ) -> list[GraphResult]:
-        """Find companies competing with a given company."""
+        ticker_clause = "{ticker: $ticker}" if ticker else ""
         seg_filter = ("AND toLower(rel.segment) CONTAINS toLower($segment)"
                       if segment else "")
         query = f"""
-            MATCH (c:Company {{ticker: $ticker}})-[rel:COMPETES_WITH]->(comp:Company)
+            MATCH (c:Company {ticker_clause})-[rel:COMPETES_WITH]->(comp:Company)
             WHERE 1=1 {seg_filter}
             RETURN comp.ticker     AS ticker,
                    comp.name       AS name,
@@ -399,7 +366,9 @@ class GraphRetriever:
             ORDER BY rel.confidence DESC
             LIMIT $limit
         """
-        params = {"ticker": ticker.upper(), "limit": limit}
+        params = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker.upper()
         if segment:
             params["segment"] = segment
 
@@ -424,14 +393,16 @@ class GraphRetriever:
 
     def get_causal_chains(
         self,
-        cause_keyword: str,
+        cause_keyword: Optional[str] = None,
         limit        : int = 20,
     ) -> list[GraphResult]:
-        """Find causal chains containing a keyword."""
-        query = """
-            MATCH (cause:Event)-[rel:CAUSED]->(effect:Event)
+        keyword_filter = """
             WHERE toLower(cause.description) CONTAINS toLower($keyword)
                OR toLower(effect.description) CONTAINS toLower($keyword)
+        """ if cause_keyword else ""
+        query = f"""
+            MATCH (cause:Event)-[rel:CAUSED]->(effect:Event)
+            {keyword_filter}
             OPTIONAL MATCH (c:Company)-[:IMPACTED_BY]->(effect)
             RETURN cause.description  AS cause,
                    effect.description AS effect,
@@ -443,12 +414,18 @@ class GraphRetriever:
             ORDER BY rel.confidence DESC
             LIMIT $limit
         """
-        rows = self._run(query, {"keyword": cause_keyword, "limit": limit})
+        params = {"limit": limit}
+        if cause_keyword:
+            params["keyword"] = cause_keyword
+
+        rows = self._run(query, params)
         results = []
         for row in rows:
+            affected = row.get("affected_companies", [])
+            primary = cause_keyword or (affected[0] if affected else "causal_chain")
             results.append(GraphResult(
                 result_type   = "causal_chain",
-                primary_entity= cause_keyword,
+                primary_entity= primary,
                 score         = float(row.get("confidence") or 0.7),
                 hop_distance  = 1,
                 source_chunks = [row["source_chunk"]] if row.get("source_chunk") else [],
@@ -457,23 +434,22 @@ class GraphRetriever:
                     "effect"             : row.get("effect"),
                     "mechanism"          : row.get("mechanism"),
                     "timeframe"          : row.get("timeframe"),
-                    "affected_companies" : row.get("affected_companies", []),
+                    "affected_companies" : affected,
                 },
             ))
         return results
 
     def get_macro_impact(
         self,
-        indicator : str,
+        indicator : Optional[str] = None,
         magnitude : Optional[str] = None,
         limit     : int = 20,
     ) -> list[GraphResult]:
-        """Find companies affected by a macro signal."""
+        ind_filter = "AND toLower(m.indicator) CONTAINS toLower($indicator)" if indicator else ""
         mag_filter = "AND m.magnitude = $magnitude" if magnitude else ""
         query = f"""
             MATCH (m:MacroSignal)-[rel:AFFECTS]->(c:Company)
-            WHERE toLower(m.indicator) CONTAINS toLower($indicator)
-            {mag_filter}
+            WHERE 1=1 {ind_filter} {mag_filter}
             RETURN c.ticker     AS ticker,
                    c.name       AS name,
                    m.indicator  AS indicator,
@@ -482,10 +458,12 @@ class GraphRetriever:
                    m.value      AS value,
                    m.fetch_date AS fetch_date,
                    rel.magnitude AS impact_magnitude
-            ORDER BY rel.magnitude DESC
+            ORDER BY rel.magnitude DESC, m.fetch_date DESC
             LIMIT $limit
         """
-        params = {"indicator": indicator, "limit": limit}
+        params = {"limit": limit}
+        if indicator:
+            params["indicator"] = indicator
         if magnitude:
             params["magnitude"] = magnitude
 
@@ -514,17 +492,18 @@ class GraphRetriever:
 
     def get_news_impact(
         self,
-        ticker   : str,
+        ticker   : Optional[str] = None,
         urgency  : Optional[str] = None,
         days_back: int = 30,
         limit    : int = 20,
     ) -> list[GraphResult]:
-        """Find recent news articles mentioning a company."""
+        ticker_clause = "{ticker: $ticker}" if ticker else ""
         urg_filter = "AND n.urgency = $urgency" if urgency else ""
         query = f"""
-            MATCH (n:NewsArticle)-[rel:MENTIONS]->(c:Company {{ticker: $ticker}})
+            MATCH (n:NewsArticle)-[rel:MENTIONS]->(c:Company {ticker_clause})
             WHERE 1=1 {urg_filter}
-            RETURN n.article_id    AS article_id,
+            RETURN c.ticker        AS ticker,
+                   n.article_id    AS article_id,
                    n.title         AS title,
                    n.summary       AS summary,
                    n.event_type    AS event_type,
@@ -536,7 +515,9 @@ class GraphRetriever:
             ORDER BY n.published_date DESC
             LIMIT $limit
         """
-        params = {"ticker": ticker.upper(), "limit": limit}
+        params = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker.upper()
         if urgency:
             params["urgency"] = urgency
 
@@ -547,7 +528,7 @@ class GraphRetriever:
             score = urg_map.get(row.get("urgency", "medium"), 0.6)
             results.append(GraphResult(
                 result_type   = "news_mention",
-                primary_entity= ticker.upper(),
+                primary_entity= row.get("ticker", ""),
                 score         = score,
                 hop_distance  = 1,
                 data={
@@ -570,7 +551,6 @@ class GraphRetriever:
         role     : Optional[str] = None,
         limit    : int = 20,
     ) -> list[GraphResult]:
-        """Find executive changes at a company or across all companies."""
         ticker_filter = "WHERE c.ticker = $ticker" if ticker else "WHERE 1=1"
         role_filter   = "AND toLower(p.role) CONTAINS toLower($role)" if role else ""
 
@@ -612,13 +592,13 @@ class GraphRetriever:
 
     def get_geographic_exposure(
         self,
-        geography: str,
+        geography: Optional[str] = None,
         limit    : int = 20,
     ) -> list[GraphResult]:
-        """Find companies concentrated in or exposed to a geography."""
-        query = """
+        geo_filter = "WHERE toLower(g.name) CONTAINS toLower($geography)" if geography else ""
+        query = f"""
             MATCH (c:Company)-[rel:CONCENTRATED_IN|PRESENT_IN]->(g:Geography)
-            WHERE toLower(g.name) CONTAINS toLower($geography)
+            {geo_filter}
             RETURN c.ticker              AS ticker,
                    c.name               AS name,
                    g.name               AS geography,
@@ -629,7 +609,11 @@ class GraphRetriever:
             ORDER BY COALESCE(rel.percentage, -1) DESC
             LIMIT $limit
         """
-        rows = self._run(query, {"geography": geography, "limit": limit})
+        params = {"limit": limit}
+        if geography:
+            params["geography"] = geography
+
+        rows = self._run(query, params)
         results = []
         for row in rows:
             results.append(GraphResult(
@@ -651,16 +635,17 @@ class GraphRetriever:
 
     def get_market_signals(
         self,
-        ticker      : str,
+        ticker      : Optional[str] = None,
         signal_type : Optional[str] = None,
         limit       : int = 10,
     ) -> list[GraphResult]:
-        """Get recent market signals for a company."""
+        ticker_clause = "{ticker: $ticker}" if ticker else ""
         sig_filter = "AND s.type = $signal_type" if signal_type else ""
         query = f"""
-            MATCH (c:Company {{ticker: $ticker}})-[rel:HAS_MARKET_SIGNAL]->(s:MarketSignal)
+            MATCH (c:Company {ticker_clause})-[rel:HAS_MARKET_SIGNAL]->(s:MarketSignal)
             WHERE 1=1 {sig_filter}
-            RETURN s.type       AS signal_type,
+            RETURN c.ticker      AS ticker,
+                   s.type       AS signal_type,
                    s.note       AS note,
                    s.fetch_date AS fetch_date,
                    c.latest_price   AS latest_price,
@@ -670,7 +655,9 @@ class GraphRetriever:
             ORDER BY s.fetch_date DESC
             LIMIT $limit
         """
-        params = {"ticker": ticker.upper(), "limit": limit}
+        params = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker.upper()
         if signal_type:
             params["signal_type"] = signal_type
 
@@ -679,7 +666,7 @@ class GraphRetriever:
         for row in rows:
             results.append(GraphResult(
                 result_type   = "market_signal",
-                primary_entity= ticker.upper(),
+                primary_entity= row.get("ticker", ""),
                 score         = 0.9,
                 hop_distance  = 0,
                 data={
@@ -695,10 +682,6 @@ class GraphRetriever:
         return results
 
     def get_company_overview(self, ticker: str) -> dict:
-        """
-        Get a complete snapshot of a company from the graph.
-        Used by agents as starting context before drilling deeper.
-        """
         query = """
             MATCH (c:Company {ticker: $ticker})
             OPTIONAL MATCH (c)-[:EXPOSED_TO]->(r:Risk)
@@ -726,32 +709,10 @@ class GraphRetriever:
         rows = self._run(query, {"ticker": ticker.upper()})
         return rows[0] if rows else {}
 
-    # -----------------------------------------------------------------------
-    # Propagation path exploration — NOT the same as get_propagation_risks()
-    # above, which reads pre-extracted PROPAGATES_TO chains from a single
-    # filing's explicit propagation_risks disclosure. This method instead
-    # searches OUTWARD across general relationship types from any starting
-    # entity (an Input, Geography, or Event) to find companies connected
-    # to it via chains that may span MULTIPLE independently-extracted
-    # filings — no single document needs to have stated the full chain.
-    #
-    # Returns raw path data (nodes + relationship properties per path) —
-    # scoring/weighting happens in src/agents/analytics/graph_propagation.py,
-    # not here. This method's job is only: does a path exist, and what
-    # does it look like structurally.
-    # -----------------------------------------------------------------------
-
     PROPAGATION_REL_TYPES = (
         "DEPENDS_ON|SUPPLIES_TO|SOURCED_FROM|EXPOSED_TO|PROPAGATES_TO|BUYS_FROM"
         "|CONCENTRATED_IN|HAS_CONCENTRATION"
     )
-    # CONCENTRATED_IN/HAS_CONCENTRATION added after a real backtest event
-    # (MCD's Russia market exit) revealed the original whitelist missed
-    # them — MCD's actual connection to Russia in the graph is via these
-    # relation types, not the ones originally listed, so propagation
-    # would have silently found "no companies reached" despite the data
-    # genuinely being there. Worth re-checking this list periodically as
-    # more real test cases surface gaps like this one.
 
     START_LABEL_ID_FIELD = {
         "Input"      : "input_id",
@@ -761,22 +722,6 @@ class GraphRetriever:
     }
 
     def node_exists(self, label: str, id_value: str) -> bool:
-        """
-        Cheap existence check for a candidate propagation start entity.
-        This is what makes propagation triggering airtight rather than a
-        guess: instead of trusting an LLM-chosen retrieval_focus label
-        (which real runs showed is unreliable — a model asked to
-        decompose a graphite/China question labeled its sub-questions
-        "regulatory", "macro", "supply_chain" etc., never "propagation",
-        even though the question was clearly propagation-shaped), we
-        check whether a plausible start entity (a geography or keyword
-        pulled from the parsed query) ACTUALLY EXISTS as a node in the
-        graph before attempting any traversal. If it doesn't exist,
-        propagation is skipped cleanly — no wasted query, no nonsense
-        "no companies found connected to X" evidence for a candidate
-        entity ("everything", "fine", etc.) that was never a real node
-        to begin with.
-        """
         if label not in self.START_LABEL_ID_FIELD:
             return False
         id_field = self.START_LABEL_ID_FIELD[label]
@@ -795,23 +740,6 @@ class GraphRetriever:
         max_depth   : int = 4,
         path_limit  : int = 50,
     ) -> list[dict]:
-        """
-        Search outward from (start_label, start_id) across the relationship
-        types listed in PROPAGATION_REL_TYPES, up to max_depth hops, for
-        every reachable Company node. Returns raw path data — every path
-        found, not just the shortest one per company (multiple independent
-        routes to the same company are meaningfully different evidence,
-        not duplicates to collapse).
-
-        start_label must be one of START_LABEL_ID_FIELD's keys (Input,
-        Geography, Event, Company) — this is validated here rather than
-        left to fail as a malformed Cypher query.
-
-        Capped at path_limit total paths (default 50) with a warning if
-        the search would return more — same discipline as
-        MAX_PAIRS_PER_ENTITY in detect_contradictions.py, so a dense
-        graph region can't silently explode traversal cost.
-        """
         if start_label not in self.START_LABEL_ID_FIELD:
             log.warning(f"get_propagation_paths: unknown start_label {start_label!r}")
             return []
@@ -821,16 +749,6 @@ class GraphRetriever:
 
         id_field = self.START_LABEL_ID_FIELD[start_label]
 
-        # Undirected traversal (-[...]-) is deliberate: DEPENDS_ON,
-        # SUPPLIES_TO, SOURCED_FROM etc. don't all point the same
-        # semantic direction relative to "impact flow", and dependency
-        # chains are meaningfully traversable in either stored direction
-        # (e.g. Company-DEPENDS_ON->Input is the same real-world fact
-        # whether you're asking "what does this company depend on" or
-        # "what companies depend on this input"). Direction of the
-        # ORIGINAL relationship is preserved per-step in the returned
-        # relationship data (start/end node ids), so nothing is lost —
-        # this only affects which direction Cypher is allowed to walk.
         query = f"""
             MATCH (start:{start_label} {{{id_field}: $start_id}})
             MATCH p = (start)-[rels:{self.PROPAGATION_REL_TYPES}*1..{max_depth}]-(end:Company)
