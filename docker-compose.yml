@@ -82,6 +82,33 @@ services:
       timeout: 10s
       retries: 10
 
+  # ── API ──────────────────────────────────────────────────────────────────────
+  # Deliberately does NOT set POSTGRES_HOST like pipeline does below — pipeline
+  # overrides it to "postgres" (the local container) for its own local-dev use,
+  # which would silently point this service at an empty local DB instead of
+  # the real Neon instance in .env if copied here. NEO4J_URI/QDRANT_URL need
+  # no such care since graph_retriever.py/vector_retriever.py already
+  # prioritize those over any local-host fallback.
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: fintel_api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TRANSFORMERS_CACHE: /cache/huggingface
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./src:/app/src
+      - ./db:/app/db
+      - ./config.py:/app/config.py
+      - huggingface_cache:/cache/huggingface
+    ports:
+      - "8090:8080"
+    networks:
+      - fintel_net
+
   # ── Pipeline ─────────────────────────────────────────────────────────────────
   pipeline:
     build:
